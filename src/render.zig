@@ -29,6 +29,10 @@ pub const Cell = struct {
         return .{ .bytes = .{ byte, 0, 0, 0 }, .len = 1, .style = style };
     }
 
+    pub fn continuation(style: Style) Cell {
+        return .{ .len = 0, .style = style };
+    }
+
     pub fn slice(self: Cell) []const u8 {
         return self.bytes[0..self.len];
     }
@@ -528,13 +532,26 @@ fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_col
             continue;
         };
         if (index + len > text.len) break;
-        if (col >= first_column) {
+        const cp = std.unicode.utf8Decode(text[index..][0..len]) catch {
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', .{}));
+            col += 1;
+            index += len;
+            continue;
+        };
+        const cell_width = codepointDisplayWidth(cp);
+        if (cell_width == 0) {
+            index += len;
+            continue;
+        }
+        if (col >= first_column and col + cell_width <= end_col) {
             var cell = Cell.space(.{});
             @memcpy(cell.bytes[0..len], text[index .. index + len]);
             cell.len = @intCast(len);
             surface.putCell(x + (col - first_column), y, cell);
+            var n: usize = 1;
+            while (n < cell_width) : (n += 1) surface.putCell(x + (col - first_column) + n, y, Cell.continuation(.{}));
         }
-        col += 1;
+        col += cell_width;
         index += len;
     }
 }
@@ -544,6 +561,65 @@ fn utf8Len(first: u8) ?usize {
     if ((first & 0b1111_0000) == 0b1110_0000) return 3;
     if ((first & 0b1111_1000) == 0b1111_0000) return 4;
     return null;
+}
+
+fn codepointDisplayWidth(cp: u21) usize {
+    if (cp == '\n' or cp == '\r') return 0;
+    if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0)) return 0;
+    if (isZeroWidthCodepoint(cp)) return 0;
+    if (isWideCodepoint(cp)) return 2;
+    return 1;
+}
+
+fn isZeroWidthCodepoint(cp: u21) bool {
+    return isCombiningMark(cp) or isVariationSelector(cp) or cp == 0x200d;
+}
+
+fn isCombiningMark(cp: u21) bool {
+    return switch (cp) {
+        0x0300...0x036f,
+        0x0483...0x0489,
+        0x0591...0x05bd,
+        0x05bf,
+        0x05c1...0x05c2,
+        0x05c4...0x05c5,
+        0x05c7,
+        0x0610...0x061a,
+        0x064b...0x065f,
+        0x0670,
+        0x06d6...0x06dc,
+        0x06df...0x06e4,
+        0x06e7...0x06e8,
+        0x06ea...0x06ed,
+        0x1ab0...0x1aff,
+        0x1dc0...0x1dff,
+        0x20d0...0x20ff,
+        0xfe20...0xfe2f,
+        => true,
+        else => false,
+    };
+}
+
+fn isVariationSelector(cp: u21) bool {
+    return cp >= 0xfe00 and cp <= 0xfe0f or cp >= 0xe0100 and cp <= 0xe01ef;
+}
+
+fn isWideCodepoint(cp: u21) bool {
+    return switch (cp) {
+        0x1100...0x115f,
+        0x2329...0x232a,
+        0x2e80...0xa4cf,
+        0xac00...0xd7a3,
+        0xf900...0xfaff,
+        0xfe10...0xfe19,
+        0xfe30...0xfe6f,
+        0xff00...0xff60,
+        0xffe0...0xffe6,
+        0x1f000...0x1faff,
+        0x20000...0x3fffd,
+        => true,
+        else => false,
+    };
 }
 
 fn decimalWidth(value: usize) usize {
@@ -664,6 +740,33 @@ test "viewport scrolls horizontally by first_column" {
     try std.testing.expectEqualStrings("e", surface.cellAt(1, 0).slice());
     try std.testing.expectEqualStrings("f", surface.cellAt(2, 0).slice());
     try std.testing.expectEqualStrings("g", surface.cellAt(3, 0).slice());
+}
+
+test "viewport renders wide unicode using display columns" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "a界b");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 4, 1);
+    defer surface.deinit();
+
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{ .line_numbers = false });
+
+    try std.testing.expectEqualStrings("a", surface.cellAt(0, 0).slice());
+    try std.testing.expectEqualStrings("界", surface.cellAt(1, 0).slice());
+    try std.testing.expectEqualStrings("", surface.cellAt(2, 0).slice());
+    try std.testing.expectEqualStrings("b", surface.cellAt(3, 0).slice());
+}
+
+test "viewport horizontal scroll respects wide unicode columns" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "a界b");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 3, 1);
+    defer surface.deinit();
+
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{ .line_numbers = false, .first_column = 1 });
+
+    try std.testing.expectEqualStrings("界", surface.cellAt(0, 0).slice());
+    try std.testing.expectEqualStrings("", surface.cellAt(1, 0).slice());
+    try std.testing.expectEqualStrings("b", surface.cellAt(2, 0).slice());
 }
 
 test "viewport clips very long lines to visible byte budget" {
