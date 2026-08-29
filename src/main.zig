@@ -292,7 +292,12 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*) };
     defer app.deinit();
 
-    var stdin_buffer: [256]u8 = undefined;
+    // Bytes read but not yet consumed (an escape/UTF-8 sequence split across
+    // reads). Retained across iterations so partial sequences never leak as
+    // literal input.
+    var pending: [256]u8 = undefined;
+    var pending_len: usize = 0;
+    var read_buf: [256]u8 = undefined;
     while (!app.should_quit) {
         try app.render(&frame);
         try nivi.render.AnsiRenderer.hideCursor(stdout);
@@ -300,13 +305,31 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
         try app.placeTerminalCursor(stdout, frame.current.rect());
         try stdout.flush();
 
-        const n = try std.posix.read(std.posix.STDIN_FILENO, &stdin_buffer);
-        if (n == 0) continue;
+        const n = try std.posix.read(std.posix.STDIN_FILENO, &read_buf);
+        if (n == 0) {
+            // Timeout with a lone pending ESC resolves to an Escape keypress;
+            // any other stale partial sequence is dropped.
+            if (pending_len == 1 and pending[0] == 0x1b) try app.handleKey(.escape);
+            pending_len = 0;
+            continue;
+        }
+
+        const copy = @min(n, pending.len - pending_len);
+        @memcpy(pending[pending_len..][0..copy], read_buf[0..copy]);
+        pending_len += copy;
+
         var index: usize = 0;
-        while (index < n) {
-            const decoded = nivi.input.decode(stdin_buffer[index..n]) orelse break;
+        while (index < pending_len) {
+            const decoded = nivi.input.decode(pending[index..pending_len]) orelse break;
             try app.handleKey(decoded.key);
             index += decoded.used;
+        }
+
+        // Drop a stuck full buffer that never forms a valid sequence.
+        if (index == 0 and pending_len == pending.len) pending_len = 0;
+        if (index != 0) {
+            std.mem.copyForwards(u8, pending[0 .. pending_len - index], pending[index..pending_len]);
+            pending_len -= index;
         }
     }
 }

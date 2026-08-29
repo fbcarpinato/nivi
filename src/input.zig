@@ -23,6 +23,10 @@ pub const DecodeResult = struct {
     used: usize,
 };
 
+/// Decode the next key from `bytes`. Returns null when `bytes` is only a prefix
+/// of a possibly-valid sequence (incomplete escape/CSI or truncated UTF-8), so
+/// the caller can retain the bytes and retry once more input arrives. A lone
+/// ESC also returns null; the caller resolves it as an Escape key on timeout.
 pub fn decode(bytes: []const u8) ?DecodeResult {
     if (bytes.len == 0) return null;
     const first = bytes[0];
@@ -38,30 +42,47 @@ pub fn decode(bytes: []const u8) ?DecodeResult {
     };
 }
 
-fn decodeEscape(bytes: []const u8) DecodeResult {
-    if (bytes.len == 1) return .{ .key = .escape, .used = 1 };
-    if (bytes.len >= 3 and bytes[1] == '[') {
-        return switch (bytes[2]) {
-            'A' => .{ .key = .arrow_up, .used = 3 },
-            'B' => .{ .key = .arrow_down, .used = 3 },
-            'C' => .{ .key = .arrow_right, .used = 3 },
-            'D' => .{ .key = .arrow_left, .used = 3 },
-            'H' => .{ .key = .home, .used = 3 },
-            'F' => .{ .key = .end, .used = 3 },
-            '1', '7' => tildeKey(bytes, .home),
-            '3' => tildeKey(bytes, .delete),
-            '4', '8' => tildeKey(bytes, .end),
-            '5' => tildeKey(bytes, .page_up),
-            '6' => tildeKey(bytes, .page_down),
-            else => .{ .key = .{ .unknown = bytes[0..3] }, .used = 3 },
-        };
-    }
-    return .{ .key = .escape, .used = 1 };
+fn decodeEscape(bytes: []const u8) ?DecodeResult {
+    // A lone ESC (or `ESC` alone so far) is ambiguous with the start of a
+    // sequence; defer to the caller's timeout flush.
+    if (bytes.len == 1) return null;
+    return switch (bytes[1]) {
+        '[', 'O' => decodeCsi(bytes),
+        else => .{ .key = .escape, .used = 1 },
+    };
 }
 
-fn tildeKey(bytes: []const u8, key: Key) DecodeResult {
-    if (bytes.len >= 4 and bytes[3] == '~') return .{ .key = key, .used = 4 };
-    return .{ .key = .{ .unknown = bytes[0..@min(bytes.len, 3)] }, .used = @min(bytes.len, 3) };
+fn decodeCsi(bytes: []const u8) ?DecodeResult {
+    // bytes[0] = ESC, bytes[1] = '[' or 'O'. Parameter/intermediate bytes run
+    // until a final byte in 0x40..0x7e. Consume the whole sequence at once.
+    var i: usize = 2;
+    while (i < bytes.len) : (i += 1) {
+        if (bytes[i] >= 0x40 and bytes[i] <= 0x7e) break;
+    }
+    if (i >= bytes.len) return null; // final byte not received yet
+    const final = bytes[i];
+    const params = bytes[2..i];
+    const used = i + 1;
+    const key: Key = switch (final) {
+        'A' => .arrow_up,
+        'B' => .arrow_down,
+        'C' => .arrow_right,
+        'D' => .arrow_left,
+        'H' => .home,
+        'F' => .end,
+        '~' => tildeKey(params),
+        else => .{ .unknown = bytes[0..used] },
+    };
+    return .{ .key = key, .used = used };
+}
+
+fn tildeKey(params: []const u8) Key {
+    if (std.mem.eql(u8, params, "1") or std.mem.eql(u8, params, "7")) return .home;
+    if (std.mem.eql(u8, params, "3")) return .delete;
+    if (std.mem.eql(u8, params, "4") or std.mem.eql(u8, params, "8")) return .end;
+    if (std.mem.eql(u8, params, "5")) return .page_up;
+    if (std.mem.eql(u8, params, "6")) return .page_down;
+    return .{ .unknown = params };
 }
 
 fn decodeUtf8(bytes: []const u8) ?DecodeResult {
@@ -97,4 +118,23 @@ test "decode utf8 character" {
     const result = decode("🌊").?;
     try std.testing.expectEqual(@as(u21, 0x1f30a), result.key.char);
     try std.testing.expectEqual(@as(usize, 4), result.used);
+}
+
+test "incomplete escape sequences return null instead of leaking bytes" {
+    // A split arrow key must not decode the leftover '[' / 'O' as a literal char.
+    try std.testing.expect(decode("\x1b") == null);
+    try std.testing.expect(decode("\x1b[") == null);
+    try std.testing.expect(decode("\x1b[3") == null);
+    try std.testing.expect(decode("\x1bO") == null);
+}
+
+test "application-cursor arrows and full CSI consume the whole sequence" {
+    try std.testing.expectEqual(Key.arrow_up, decode("\x1bOA").?.key);
+    try std.testing.expectEqual(@as(usize, 3), decode("\x1bOA").?.used);
+    try std.testing.expectEqual(Key.page_up, decode("\x1b[5~").?.key);
+    try std.testing.expectEqual(@as(usize, 4), decode("\x1b[5~").?.used);
+}
+
+test "truncated utf8 returns null" {
+    try std.testing.expect(decode("\xf0\x9f") == null);
 }
