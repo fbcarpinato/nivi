@@ -225,6 +225,18 @@ pub const UndoTree = struct {
         if (auto) self.commitOpen();
     }
 
+    pub fn recordReplacement(self: *UndoTree, offset: usize, old_text: []const u8, new_text: []const u8) !void {
+        const auto = self.group_depth == 0;
+        const txn = self.ensureOpen(offset);
+
+        var edit: Edit = .{ .offset = offset };
+        try edit.old_text.appendSlice(self.allocator, old_text);
+        try edit.new_text.appendSlice(self.allocator, new_text);
+        try txn.edits.append(self.allocator, edit);
+        txn.cursor_after = offset + new_text.len;
+        if (auto) self.commitOpen();
+    }
+
     /// Turn the open transaction into a new child node of `current`.
     pub fn commitOpen(self: *UndoTree) void {
         var open = self.open orelse return;

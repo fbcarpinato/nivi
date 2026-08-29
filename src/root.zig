@@ -6,6 +6,7 @@ pub const UndoTree = @import("undotree.zig").UndoTree;
 pub const render = @import("render.zig");
 pub const input = @import("input.zig");
 pub const terminal = @import("terminal.zig");
+pub const vim = @import("vim.zig");
 
 test {
     _ = @import("rope.zig");
@@ -14,4 +15,5 @@ test {
     _ = @import("render.zig");
     _ = @import("input.zig");
     _ = @import("terminal.zig");
+    _ = @import("vim.zig");
 }

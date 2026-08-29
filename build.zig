@@ -79,6 +79,22 @@ pub fn build(b: *std.Build) void {
     const bench_render_cmd = b.addRunArtifact(bench_render);
     bench_render_step.dependOn(&bench_render_cmd.step);
 
+    const bench_vim = b.addExecutable(.{
+        .name = "bench-vim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_vim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nivi", .module = mod },
+            },
+        }),
+    });
+
+    const bench_vim_step = b.step("bench-vim", "Run Vim command engine benchmarks");
+    const bench_vim_cmd = b.addRunArtifact(bench_vim);
+    bench_vim_step.dependOn(&bench_vim_cmd.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

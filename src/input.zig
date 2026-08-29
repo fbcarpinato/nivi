@@ -15,6 +15,8 @@ pub const Key = union(enum) {
     end,
     page_up,
     page_down,
+    ctrl_arrow_up,
+    ctrl_arrow_down,
     unknown: []const u8,
 };
 
@@ -64,25 +66,55 @@ fn decodeCsi(bytes: []const u8) ?DecodeResult {
     const params = bytes[2..i];
     const used = i + 1;
     const key: Key = switch (final) {
-        'A' => .arrow_up,
-        'B' => .arrow_down,
+        'A' => modifiedArrow(params, .arrow_up, .ctrl_arrow_up),
+        'B' => modifiedArrow(params, .arrow_down, .ctrl_arrow_down),
         'C' => .arrow_right,
         'D' => .arrow_left,
         'H' => .home,
         'F' => .end,
         '~' => tildeKey(params),
+        'u' => modifiedKey(params),
         else => .{ .unknown = bytes[0..used] },
     };
     return .{ .key = key, .used = used };
 }
 
+fn modifiedArrow(params: []const u8, plain: Key, ctrl: Key) Key {
+    if (hasCtrlModifier(params)) return ctrl;
+    return plain;
+}
+
 fn tildeKey(params: []const u8) Key {
+    if (modifiedArrowTilde(params)) |key| return key;
     if (std.mem.eql(u8, params, "1") or std.mem.eql(u8, params, "7")) return .home;
     if (std.mem.eql(u8, params, "3")) return .delete;
     if (std.mem.eql(u8, params, "4") or std.mem.eql(u8, params, "8")) return .end;
     if (std.mem.eql(u8, params, "5")) return .page_up;
     if (std.mem.eql(u8, params, "6")) return .page_down;
     return .{ .unknown = params };
+}
+
+fn modifiedKey(params: []const u8) Key {
+    if (!hasCtrlModifier(params)) return .{ .unknown = params };
+    if (std.mem.indexOf(u8, params, "65") != null) return .ctrl_arrow_up;
+    if (std.mem.indexOf(u8, params, "66") != null) return .ctrl_arrow_down;
+    return .{ .unknown = params };
+}
+
+fn modifiedArrowTilde(params: []const u8) ?Key {
+    if (!hasCtrlModifier(params)) return null;
+    if (std.mem.endsWith(u8, params, ";65") or std.mem.endsWith(u8, params, ":65")) return .ctrl_arrow_up;
+    if (std.mem.endsWith(u8, params, ";66") or std.mem.endsWith(u8, params, ":66")) return .ctrl_arrow_down;
+    return null;
+}
+
+fn hasCtrlModifier(params: []const u8) bool {
+    if (std.mem.eql(u8, params, "5")) return true;
+    var tokens = std.mem.tokenizeAny(u8, params, ";:");
+    while (tokens.next()) |token| {
+        if (std.mem.eql(u8, token, "5")) return true;
+    }
+    return false;
 }
 
 fn decodeUtf8(bytes: []const u8) ?DecodeResult {
@@ -112,6 +144,16 @@ test "decode arrows and delete" {
     try std.testing.expectEqual(Key.arrow_right, decode("\x1b[C").?.key);
     try std.testing.expectEqual(Key.arrow_left, decode("\x1b[D").?.key);
     try std.testing.expectEqual(Key.delete, decode("\x1b[3~").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_up, decode("\x1b[1;5A").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_down, decode("\x1b[1;5B").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_up, decode("\x1b[5A").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_down, decode("\x1b[5B").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_up, decode("\x1b[1:5A").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_down, decode("\x1b[1:5B").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_up, decode("\x1b[27;5;65~").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_down, decode("\x1b[27;5;66~").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_up, decode("\x1b[65;5u").?.key);
+    try std.testing.expectEqual(Key.ctrl_arrow_down, decode("\x1b[66;5u").?.key);
 }
 
 test "decode utf8 character" {

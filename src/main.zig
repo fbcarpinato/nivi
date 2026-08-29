@@ -14,6 +14,7 @@ const App = struct {
     io: Io,
     buffer: *Buffer,
     cursor: Cursor,
+    vim: nivi.vim.State,
     mode: Mode = .normal,
     first_line: usize = 0,
     first_column: usize = 0,
@@ -26,6 +27,7 @@ const App = struct {
     should_quit: bool = false,
 
     fn deinit(self: *App) void {
+        self.vim.deinit();
         self.command.deinit(self.allocator);
         self.message.deinit(self.allocator);
         self.render_scratch.deinit(self.allocator);
@@ -55,29 +57,41 @@ const App = struct {
     fn handleNormal(self: *App, key: Key) !void {
         switch (key) {
             .char => |ch| switch (ch) {
-                'i' => self.mode = .insert,
                 ':' => {
+                    self.vim.cancel();
                     self.command.clearRetainingCapacity();
                     self.mode = .command;
                 },
-                'h' => try self.cursor.moveLeft(self.buffer.*),
-                'j' => try self.cursor.moveDown(self.buffer.*),
-                'k' => try self.cursor.moveUp(self.buffer.*),
-                'l' => try self.cursor.moveRight(self.buffer.*),
-                '0' => try self.cursor.moveToLineStart(self.buffer.*),
-                '$' => try self.cursor.moveToLineEnd(self.buffer.*),
-                'x' => try self.cursor.deleteForward(self.buffer),
-                'u' => if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset),
-                'r' => if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset),
-                else => {},
+                'u' => {
+                    self.vim.cancel();
+                    if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
+                },
+                'r' => {
+                    self.vim.cancel();
+                    if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
+                },
+                else => try self.handleVimNormal(key),
             },
-            .arrow_left => try self.cursor.moveLeft(self.buffer.*),
-            .arrow_right => try self.cursor.moveRight(self.buffer.*),
-            .arrow_up => try self.cursor.moveUp(self.buffer.*),
-            .arrow_down => try self.cursor.moveDown(self.buffer.*),
-            .home => try self.cursor.moveToLineStart(self.buffer.*),
-            .end => try self.cursor.moveToLineEnd(self.buffer.*),
+            .ctrl, .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => try self.handleVimNormal(key),
+            .unknown => |bytes| try self.setUnknownKeyMessage(bytes),
             else => {},
+        }
+    }
+
+    fn setUnknownKeyMessage(self: *App, bytes: []const u8) !void {
+        self.message.clearRetainingCapacity();
+        try self.message.appendSlice(self.allocator, "unknown key:");
+        for (bytes) |byte| {
+            var buf: [8]u8 = undefined;
+            const part = std.fmt.bufPrint(&buf, " {X:0>2}", .{byte}) catch unreachable;
+            try self.message.appendSlice(self.allocator, part);
+        }
+    }
+
+    fn handleVimNormal(self: *App, key: Key) !void {
+        switch (try self.vim.handleNormal(self.buffer, &self.cursor, key)) {
+            .none => {},
+            .enter_insert => self.mode = .insert,
         }
     }
 
@@ -303,7 +317,7 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var frame = try nivi.render.FrameRenderer.init(allocator, size.width, size.height);
     defer frame.deinit();
 
-    var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*) };
+    var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*), .vim = nivi.vim.State.init(allocator) };
     defer app.deinit();
 
     // Bytes read but not yet consumed (an escape/UTF-8 sequence split across

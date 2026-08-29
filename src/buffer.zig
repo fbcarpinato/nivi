@@ -84,6 +84,10 @@ pub const Buffer = struct {
         return self.rope.byteLen();
     }
 
+    pub fn byteAt(self: Buffer, offset: usize) u8 {
+        return self.rope.byteAt(offset);
+    }
+
     /// Number of display lines (newline count + 1 for a non-empty final line).
     pub fn lineCount(self: Buffer) usize {
         return self.rope.lineCount() + 1;
@@ -125,6 +129,14 @@ pub const Buffer = struct {
         return self.rope.toOwnedSlice(allocator);
     }
 
+    pub fn toOwnedRange(self: Buffer, allocator: std.mem.Allocator, range: ByteRange) ![]u8 {
+        const end = @min(range.end, self.byteLen());
+        const start = @min(range.start, end);
+        const text = try allocator.alloc(u8, end - start);
+        self.copyRange(text, start);
+        return text;
+    }
+
     pub fn insert(self: *Buffer, offset: usize, text: []const u8) !void {
         if (text.len == 0) return;
         try self.undo_tree.recordInsertion(offset, text);
@@ -136,6 +148,17 @@ pub const Buffer = struct {
         if (len == 0) return;
         try self.recordDeletionRange(offset, len);
         try self.rope.delete(offset, len);
+        self.touch();
+    }
+
+    pub fn replace(self: *Buffer, offset: usize, len: usize, text: []const u8) !void {
+        if (len == 0 and text.len == 0) return;
+        self.delete_scratch.clearRetainingCapacity();
+        try self.delete_scratch.resize(self.allocator, len);
+        self.copyRange(self.delete_scratch.items, offset);
+        try self.undo_tree.recordReplacement(offset, self.delete_scratch.items, text);
+        if (len != 0) try self.rope.delete(offset, len);
+        if (text.len != 0) try self.rope.insert(offset, text);
         self.touch();
     }
 
