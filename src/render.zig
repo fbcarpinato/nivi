@@ -411,6 +411,7 @@ pub const FrameRenderer = struct {
 
 pub const ViewportOptions = struct {
     first_line: usize = 0,
+    first_column: usize = 0,
     cursor_line: usize = 0,
     line_numbers: bool = true,
     relative_line_numbers: bool = false,
@@ -468,10 +469,12 @@ pub fn renderBufferViewportScratch(
 
         const range = buffer.lineContentRange(line);
         const line_len = range.end - range.start;
-        const copy_len = @min(line_len, text_width * 4 + 16);
+        // Copy enough bytes to cover the visible window (including the scrolled-off
+        // left part), bounded so a multi-MiB line never copies more than needed.
+        const copy_len = @min(line_len, (options.first_column + text_width) * 4 + 16);
         try scratch.resize(allocator, copy_len);
         buffer.copyRange(scratch.items, range.start);
-        renderLineText(surface, text_x, y, text_width, scratch.items, options.tab_width);
+        renderLineText(surface, text_x, y, text_width, options.first_column, scratch.items, options.tab_width);
     }
 }
 
@@ -493,39 +496,44 @@ fn distance(a: usize, b: usize) usize {
     return if (a > b) a - b else b - a;
 }
 
-fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, text: []const u8, tab_width: usize) void {
+fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_column: usize, text: []const u8, tab_width: usize) void {
+    // `col` is the line's visual column; only columns in [first_column,
+    // first_column + width) are drawn, at surface x + (col - first_column).
     var col: usize = 0;
     var index: usize = 0;
-    while (index < text.len and col < width) {
+    const end_col = first_column + width;
+    while (index < text.len and col < end_col) {
         const byte = text[index];
         if (byte == '\t') {
             const spaces = @max(@as(usize, 1), tab_width - (col % tab_width));
             var n: usize = 0;
-            while (n < spaces and col < width) : (n += 1) {
-                surface.putCell(x + col, y, Cell.ascii(' ', .{}));
+            while (n < spaces and col < end_col) : (n += 1) {
+                if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(' ', .{}));
                 col += 1;
             }
             index += 1;
             continue;
         }
         if (byte < 0x80) {
-            surface.putCell(x + col, y, Cell.ascii(if (std.ascii.isPrint(byte)) byte else '?', .{}));
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(if (std.ascii.isPrint(byte)) byte else '?', .{}));
             col += 1;
             index += 1;
             continue;
         }
 
         const len = utf8Len(byte) orelse {
-            surface.putCell(x + col, y, Cell.ascii('?', .{}));
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', .{}));
             col += 1;
             index += 1;
             continue;
         };
         if (index + len > text.len) break;
-        var cell = Cell.space(.{});
-        @memcpy(cell.bytes[0..len], text[index .. index + len]);
-        cell.len = @intCast(len);
-        surface.putCell(x + col, y, cell);
+        if (col >= first_column) {
+            var cell = Cell.space(.{});
+            @memcpy(cell.bytes[0..len], text[index .. index + len]);
+            cell.len = @intCast(len);
+            surface.putCell(x + (col - first_column), y, cell);
+        }
         col += 1;
         index += len;
     }
@@ -642,6 +650,20 @@ test "viewport expands tabs" {
     try std.testing.expectEqualStrings(" ", surface.cellAt(2, 0).slice());
     try std.testing.expectEqualStrings(" ", surface.cellAt(3, 0).slice());
     try std.testing.expectEqualStrings("b", surface.cellAt(4, 0).slice());
+}
+
+test "viewport scrolls horizontally by first_column" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcdefghij");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 4, 1);
+    defer surface.deinit();
+
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{ .line_numbers = false, .first_column = 3 });
+
+    try std.testing.expectEqualStrings("d", surface.cellAt(0, 0).slice());
+    try std.testing.expectEqualStrings("e", surface.cellAt(1, 0).slice());
+    try std.testing.expectEqualStrings("f", surface.cellAt(2, 0).slice());
+    try std.testing.expectEqualStrings("g", surface.cellAt(3, 0).slice());
 }
 
 test "viewport clips very long lines to visible byte budget" {

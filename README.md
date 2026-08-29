@@ -158,6 +158,9 @@ more than absolute values):
       first-frame full render, dirty-rect diff, and full-screen diff fallback.
 - [x] Line-number gutter as the first composable side component.
 - [x] Relative line numbers with highlighted absolute cursor line.
+- [x] Vertical and horizontal scrolling: the viewport follows the cursor by
+      line (`first_line`) and visual column (`first_column`), so long lines scroll
+      sideways instead of clamping the caret.
 - [x] Viewport rendering copies only visible line ranges from the rope, avoiding
       whole-buffer flattening; long lines clipped to a visible-byte budget.
 - [x] Reusable per-frame render scratch + cached cursor line/visual-column so a

@@ -32,6 +32,7 @@ pub fn main() !void {
     printStat("viewport_render_relative_numbers", try benchViewport(allocator, buffer, 120, 40, true), 1);
     printStat("viewport_render_unicode", try benchViewport(allocator, unicode_buffer, 120, 40, true), 1);
     printStat("viewport_render_huge_line", try benchViewport(allocator, huge_line_buffer, 120, 40, true), 1);
+    printStat("viewport_render_huge_line_hscroll", try benchViewportHScroll(allocator, huge_line_buffer, 120, 40, 4000), 1);
 
     printStat("frame_present_full_80x24", try benchFrameFull(allocator, 80, 24), 1);
     printStat("frame_present_diff_one_cell", try benchFrameDiffOneCell(allocator, 80, 24, 50_000), 50_000);
@@ -102,6 +103,25 @@ fn benchViewport(allocator: std.mem.Allocator, buffer: nivi.Buffer, width: usize
             .first_line = if (buffer.lineCount() > 100) 100 else 0,
             .cursor_line = if (buffer.lineCount() > 112) 112 else 0,
             .relative_line_numbers = relative,
+        });
+        std.mem.doNotOptimizeAway(surface.cells[width + 1]);
+        best = @min(best, elapsed(start));
+    }
+    return best;
+}
+
+fn benchViewportHScroll(allocator: std.mem.Allocator, buffer: nivi.Buffer, width: usize, height: usize, first_column: usize) !u64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..samples) |_| {
+        var surface = try nivi.render.Surface.init(allocator, width, height);
+        defer surface.deinit();
+        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+        defer scratch.deinit(allocator);
+
+        const start = nowNanos();
+        try nivi.render.renderBufferViewportScratch(allocator, &scratch, &surface, surface.rect(), buffer, .{
+            .first_column = first_column,
+            .relative_line_numbers = true,
         });
         std.mem.doNotOptimizeAway(surface.cells[width + 1]);
         best = @min(best, elapsed(start));

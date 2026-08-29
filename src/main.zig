@@ -16,6 +16,7 @@ const App = struct {
     cursor: Cursor,
     mode: Mode = .normal,
     first_line: usize = 0,
+    first_column: usize = 0,
     editor_area: Rect = .{ .x = 0, .y = 0, .width = 0, .height = 1 },
     cursor_line: usize = 0,
     cursor_visual_column: usize = 0,
@@ -146,6 +147,17 @@ const App = struct {
         const line_count = self.buffer.lineCount();
         if (line_count > height and self.first_line > line_count - height) self.first_line = line_count - height;
         if (line_count <= height) self.first_line = 0;
+
+        const gutter = nivi.render.gutterWidth(self.buffer.*);
+        const text_width = self.editor_area.width -| gutter;
+        const col = self.cursor_visual_column;
+        if (text_width == 0) {
+            self.first_column = 0;
+        } else if (col < self.first_column) {
+            self.first_column = col;
+        } else if (col >= self.first_column + text_width) {
+            self.first_column = col - text_width + 1;
+        }
     }
 
     fn render(self: *App, frame: *nivi.render.FrameRenderer) !void {
@@ -161,6 +173,7 @@ const App = struct {
 
         try nivi.render.renderBufferViewportScratch(self.allocator, &self.render_scratch, &frame.current, editor_area, self.buffer.*, .{
             .first_line = self.first_line,
+            .first_column = self.first_column,
             .cursor_line = self.cursor_line,
             .relative_line_numbers = true,
         });
@@ -189,7 +202,8 @@ const App = struct {
         const editor_area = screen.splitBottom(1).second.splitBottom(1).second;
         const row = if (self.cursor_line >= self.first_line) self.cursor_line - self.first_line else 0;
         const gutter = nivi.render.gutterWidth(self.buffer.*);
-        const col = self.cursor_visual_column + gutter;
+        const scrolled_col = self.cursor_visual_column -| self.first_column;
+        const col = scrolled_col + gutter;
         const x = @min(editor_area.x + col, editor_area.right() -| 1);
         const y = @min(editor_area.y + row, editor_area.bottom() -| 1);
         try nivi.render.AnsiRenderer.cursorTo(writer, x, y);
