@@ -421,6 +421,7 @@ pub const ViewportOptions = struct {
     relative_line_numbers: bool = false,
     gutter_width: usize = 0,
     tab_width: usize = 4,
+    selection: ?Buffer.ByteRange = null,
 };
 
 pub fn gutterWidth(buffer: Buffer) usize {
@@ -478,7 +479,7 @@ pub fn renderBufferViewportScratch(
         const copy_len = @min(line_len, (options.first_column + text_width) * 4 + 16);
         try scratch.resize(allocator, copy_len);
         buffer.copyRange(scratch.items, range.start);
-        renderLineText(surface, text_x, y, text_width, options.first_column, scratch.items, options.tab_width);
+        renderLineText(surface, text_x, y, text_width, options.first_column, scratch.items, range.start, options.selection, options.tab_width);
     }
 }
 
@@ -500,7 +501,7 @@ fn distance(a: usize, b: usize) usize {
     return if (a > b) a - b else b - a;
 }
 
-fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_column: usize, text: []const u8, tab_width: usize) void {
+fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_column: usize, text: []const u8, line_start: usize, selection: ?Buffer.ByteRange, tab_width: usize) void {
     // `col` is the line's visual column; only columns in [first_column,
     // first_column + width) are drawn, at surface x + (col - first_column).
     var col: usize = 0;
@@ -508,32 +509,33 @@ fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_col
     const end_col = first_column + width;
     while (index < text.len and col < end_col) {
         const byte = text[index];
+        const style = styleForByte(line_start + index, selection);
         if (byte == '\t') {
             const spaces = @max(@as(usize, 1), tab_width - (col % tab_width));
             var n: usize = 0;
             while (n < spaces and col < end_col) : (n += 1) {
-                if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(' ', .{}));
+                if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(' ', style));
                 col += 1;
             }
             index += 1;
             continue;
         }
         if (byte < 0x80) {
-            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(if (std.ascii.isPrint(byte)) byte else '?', .{}));
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii(if (std.ascii.isPrint(byte)) byte else '?', style));
             col += 1;
             index += 1;
             continue;
         }
 
         const len = utf8Len(byte) orelse {
-            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', .{}));
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', style));
             col += 1;
             index += 1;
             continue;
         };
         if (index + len > text.len) break;
         const cp = std.unicode.utf8Decode(text[index..][0..len]) catch {
-            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', .{}));
+            if (col >= first_column) surface.putCell(x + (col - first_column), y, Cell.ascii('?', style));
             col += 1;
             index += len;
             continue;
@@ -544,16 +546,22 @@ fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_col
             continue;
         }
         if (col >= first_column and col + cell_width <= end_col) {
-            var cell = Cell.space(.{});
+            var cell = Cell.space(style);
             @memcpy(cell.bytes[0..len], text[index .. index + len]);
             cell.len = @intCast(len);
             surface.putCell(x + (col - first_column), y, cell);
             var n: usize = 1;
-            while (n < cell_width) : (n += 1) surface.putCell(x + (col - first_column) + n, y, Cell.continuation(.{}));
+            while (n < cell_width) : (n += 1) surface.putCell(x + (col - first_column) + n, y, Cell.continuation(style));
         }
         col += cell_width;
         index += len;
     }
+}
+
+fn styleForByte(offset: usize, selection: ?Buffer.ByteRange) Style {
+    const range = selection orelse return .{};
+    if (offset >= range.start and offset < range.end) return .{ .bg = .selection };
+    return .{};
 }
 
 fn utf8Len(first: u8) ?usize {
@@ -740,6 +748,23 @@ test "viewport scrolls horizontally by first_column" {
     try std.testing.expectEqualStrings("e", surface.cellAt(1, 0).slice());
     try std.testing.expectEqualStrings("f", surface.cellAt(2, 0).slice());
     try std.testing.expectEqualStrings("g", surface.cellAt(3, 0).slice());
+}
+
+test "viewport highlights selected bytes" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcd");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 4, 1);
+    defer surface.deinit();
+
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{
+        .line_numbers = false,
+        .selection = .{ .start = 1, .end = 3 },
+    });
+
+    try std.testing.expectEqual(Color.default, surface.cellAt(0, 0).style.bg);
+    try std.testing.expectEqual(Color.selection, surface.cellAt(1, 0).style.bg);
+    try std.testing.expectEqual(Color.selection, surface.cellAt(2, 0).style.bg);
+    try std.testing.expectEqual(Color.default, surface.cellAt(3, 0).style.bg);
 }
 
 test "viewport renders wide unicode using display columns" {

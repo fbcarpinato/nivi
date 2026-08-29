@@ -4,16 +4,18 @@ const nivi = @import("nivi");
 const Io = std.Io;
 const Buffer = nivi.Buffer;
 const Cursor = nivi.Cursor;
+const Selection = nivi.Selection;
 const Key = nivi.input.Key;
 const Rect = nivi.render.Rect;
 
-const Mode = enum { normal, insert, command };
+const Mode = enum { normal, insert, command, visual, visual_line };
 
 const App = struct {
     allocator: std.mem.Allocator,
     io: Io,
     buffer: *Buffer,
     cursor: Cursor,
+    selection: Selection,
     vim: nivi.vim.State,
     mode: Mode = .normal,
     first_line: usize = 0,
@@ -45,6 +47,7 @@ const App = struct {
             .normal => try self.handleNormal(key),
             .insert => try self.handleInsert(key),
             .command => try self.handleCommand(key),
+            .visual, .visual_line => try self.handleVisual(key),
         }
         try self.keepCursorVisible();
     }
@@ -66,13 +69,13 @@ const App = struct {
                     self.vim.cancel();
                     if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
                 },
-                'r' => {
-                    self.vim.cancel();
-                    if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
-                },
                 else => try self.handleVimNormal(key),
             },
-            .ctrl, .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => try self.handleVimNormal(key),
+            .ctrl => |ch| if (ch == 'r') {
+                self.vim.cancel();
+                if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
+            } else try self.handleVimNormal(key),
+            .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => try self.handleVimNormal(key),
             .unknown => |bytes| try self.setUnknownKeyMessage(bytes),
             else => {},
         }
@@ -92,6 +95,25 @@ const App = struct {
         switch (try self.vim.handleNormal(self.buffer, &self.cursor, key)) {
             .none => {},
             .enter_insert => self.mode = .insert,
+            .enter_visual => try self.enterVisual(.visual),
+            .enter_visual_line => try self.enterVisual(.visual_line),
+            .exit_visual => self.mode = .normal,
+        }
+    }
+
+    fn enterVisual(self: *App, mode: Mode) !void {
+        try self.cursor.sync(self.buffer.*);
+        self.selection = Selection.fromCursor(self.cursor);
+        self.mode = mode;
+    }
+
+    fn handleVisual(self: *App, key: Key) !void {
+        switch (try self.vim.handleVisual(self.buffer, &self.cursor, &self.selection, self.mode == .visual_line, key)) {
+            .none => {},
+            .enter_insert => self.mode = .insert,
+            .enter_visual => try self.enterVisual(.visual),
+            .enter_visual_line => self.mode = .visual_line,
+            .exit_visual => self.mode = .normal,
         }
     }
 
@@ -174,6 +196,14 @@ const App = struct {
         }
     }
 
+    fn renderSelection(self: *App) !?Buffer.ByteRange {
+        return switch (self.mode) {
+            .visual => try nivi.vim.selectedRange(self.buffer.*, self.selection, false),
+            .visual_line => try nivi.vim.selectedRange(self.buffer.*, self.selection, true),
+            else => null,
+        };
+    }
+
     fn render(self: *App, frame: *nivi.render.FrameRenderer) !void {
         try self.refreshCursorMetrics();
         frame.beginFrame(.{});
@@ -190,6 +220,7 @@ const App = struct {
             .first_column = self.first_column,
             .cursor_line = self.cursor_line,
             .relative_line_numbers = true,
+            .selection = try self.renderSelection(),
         });
         try frame.markDirty(editor_area);
         self.renderStatus(&frame.current, status_area);
@@ -201,7 +232,7 @@ const App = struct {
     fn placeTerminalCursor(self: *App, writer: *Io.Writer, screen: Rect) !void {
         const shape: nivi.render.AnsiRenderer.CursorShape = switch (self.mode) {
             .insert => .bar,
-            .normal, .command => .block,
+            .normal, .command, .visual, .visual_line => .block,
         };
         try nivi.render.AnsiRenderer.setCursorShape(writer, shape);
 
@@ -234,6 +265,8 @@ const App = struct {
             .normal => "NORMAL",
             .insert => "INSERT",
             .command => "COMMAND",
+            .visual => "VISUAL",
+            .visual_line => "V-LINE",
         };
         const line = self.cursor_line + 1;
         const col = self.cursor_visual_column + 1;
@@ -317,7 +350,7 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var frame = try nivi.render.FrameRenderer.init(allocator, size.width, size.height);
     defer frame.deinit();
 
-    var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*), .vim = nivi.vim.State.init(allocator) };
+    var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*), .selection = Selection.init(buffer.*), .vim = nivi.vim.State.init(allocator) };
     defer app.deinit();
 
     // Bytes read but not yet consumed (an escape/UTF-8 sequence split across

@@ -1,11 +1,15 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
 const Cursor = @import("buffer.zig").Cursor;
+const Selection = @import("buffer.zig").Selection;
 const Key = @import("input.zig").Key;
 
 pub const Action = enum {
     none,
     enter_insert,
+    enter_visual,
+    enter_visual_line,
+    exit_visual,
 };
 
 const Operator = enum {
@@ -125,6 +129,14 @@ pub const State = struct {
                 self.resetCommand();
                 return .enter_insert;
             },
+            'v' => {
+                self.resetCommand();
+                return .enter_visual;
+            },
+            'V' => {
+                self.resetCommand();
+                return .enter_visual_line;
+            },
             'a' => return self.enterAppend(buffer, cursor),
             'A' => return self.enterLineEnd(buffer.*, cursor),
             'I' => return self.enterFirstNonBlank(buffer.*, cursor),
@@ -170,6 +182,141 @@ pub const State = struct {
                 return .none;
             },
         }
+    }
+
+    pub fn handleVisual(self: *State, buffer: *Buffer, cursor: *Cursor, selection: *Selection, linewise: bool, key: Key) !Action {
+        switch (key) {
+            .escape => {
+                self.resetCommand();
+                return .exit_visual;
+            },
+            .ctrl => |ch| switch (ch) {
+                'u' => return self.applyVisualMotion(buffer.*, cursor, selection, .half_page_up),
+                'd' => return self.applyVisualMotion(buffer.*, cursor, selection, .half_page_down),
+                'k', 'p' => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_backward),
+                'j', 'n' => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_forward),
+                else => return .none,
+            },
+            .ctrl_arrow_up => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_backward),
+            .ctrl_arrow_down => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_forward),
+            .page_up => return self.applyVisualMotion(buffer.*, cursor, selection, .half_page_up),
+            .page_down => return self.applyVisualMotion(buffer.*, cursor, selection, .half_page_down),
+            .arrow_left => return self.applyVisualMotion(buffer.*, cursor, selection, .left),
+            .arrow_down => return self.applyVisualMotion(buffer.*, cursor, selection, .down),
+            .arrow_up => return self.applyVisualMotion(buffer.*, cursor, selection, .up),
+            .arrow_right => return self.applyVisualMotion(buffer.*, cursor, selection, .right),
+            .home => return self.applyVisualMotion(buffer.*, cursor, selection, .line_start),
+            .end => return self.applyVisualMotion(buffer.*, cursor, selection, .line_end),
+            .char => |ch| switch (ch) {
+                'v' => return .exit_visual,
+                'V' => return if (linewise) .exit_visual else .enter_visual_line,
+                'o', 'O' => return self.swapVisualEnds(buffer.*, cursor, selection),
+                'h' => return self.applyVisualMotion(buffer.*, cursor, selection, .left),
+                'j' => return self.applyVisualMotion(buffer.*, cursor, selection, .down),
+                'k' => return self.applyVisualMotion(buffer.*, cursor, selection, .up),
+                'J' => return self.moveVisualLines(buffer, cursor, selection, .down),
+                'K' => return self.moveVisualLines(buffer, cursor, selection, .up),
+                'l' => return self.applyVisualMotion(buffer.*, cursor, selection, .right),
+                '0' => return self.applyVisualMotion(buffer.*, cursor, selection, .line_start),
+                '$' => return self.applyVisualMotion(buffer.*, cursor, selection, .line_end),
+                'w' => return self.applyVisualMotion(buffer.*, cursor, selection, .word_forward),
+                'b' => return self.applyVisualMotion(buffer.*, cursor, selection, .word_backward),
+                'e' => return self.applyVisualMotion(buffer.*, cursor, selection, .word_end),
+                '{' => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_backward),
+                '}' => return self.applyVisualMotion(buffer.*, cursor, selection, .paragraph_forward),
+                'd', 'x' => return self.applyVisualOperator(buffer, cursor, selection.*, .delete, linewise),
+                'c', 's' => return self.applyVisualOperator(buffer, cursor, selection.*, .change, linewise),
+                'y' => return self.applyVisualOperator(buffer, cursor, selection.*, .yank, linewise),
+                'p', 'P' => return self.pasteOverVisual(buffer, cursor, selection.*, linewise),
+                else => return .none,
+            },
+            else => return .none,
+        }
+    }
+
+    fn applyVisualMotion(self: *State, buffer: Buffer, cursor: *Cursor, selection: *Selection, motion: Motion) !Action {
+        const repeat = commandCount(self.count);
+        self.resetCommand();
+        try moveCursor(buffer, cursor, motion, repeat);
+        selection.setHead(buffer, cursor.offset);
+        return .none;
+    }
+
+    fn swapVisualEnds(self: *State, buffer: Buffer, cursor: *Cursor, selection: *Selection) !Action {
+        self.resetCommand();
+        const old_anchor = selection.anchor;
+        selection.anchor = selection.head;
+        selection.head = old_anchor;
+        try cursor.setOffset(buffer, selection.head);
+        return .none;
+    }
+
+    fn applyVisualOperator(self: *State, buffer: *Buffer, cursor: *Cursor, selection: Selection, operator: Operator, linewise: bool) !Action {
+        self.resetCommand();
+        const range = try selectedRange(buffer.*, selection, linewise);
+        if (range.end <= range.start) return .exit_visual;
+        try self.setRegister(operator, buffer.*, range, linewise);
+        if (operator == .yank) return .exit_visual;
+        try buffer.delete(range.start, range.end - range.start);
+        try cursor.setOffset(buffer.*, range.start);
+        return if (operator == .change) .enter_insert else .exit_visual;
+    }
+
+    fn pasteOverVisual(self: *State, buffer: *Buffer, cursor: *Cursor, selection: Selection, linewise: bool) !Action {
+        self.resetCommand();
+        const register = self.activePasteRegister();
+        if (register.isEmpty()) return .exit_visual;
+        const range = try selectedRange(buffer.*, selection, linewise);
+        if (range.end <= range.start) return .exit_visual;
+        if (!self.yank_register.isEmpty()) try self.delete_register.setFromRange(self.allocator, buffer.*, range, linewise);
+        try buffer.replace(range.start, range.end - range.start, register.text.items);
+        try cursor.setOffset(buffer.*, range.start);
+        return .exit_visual;
+    }
+
+    fn moveVisualLines(self: *State, buffer: *Buffer, cursor: *Cursor, selection: *Selection, direction: VerticalDirection) !Action {
+        self.resetCommand();
+        const original_anchor = selection.anchor;
+        const original_head = selection.head;
+        const anchor_line = buffer.lineAt(original_anchor);
+        const head_line = buffer.lineAt(original_head);
+        const start_line = @min(anchor_line, head_line);
+        const end_line = @max(anchor_line, head_line);
+        const start = buffer.byteOffsetForLine(start_line);
+        const end = if (end_line + 1 >= buffer.lineCount()) buffer.byteLen() else buffer.byteOffsetForLine(end_line + 1);
+
+        switch (direction) {
+            .up => {
+                if (start_line == 0) return .none;
+                const other_start = buffer.byteOffsetForLine(start_line - 1);
+                try self.swapLineBlocks(buffer, other_start, start, end);
+                const delta = start - other_start;
+                selection.anchor = original_anchor - delta;
+                selection.head = original_head - delta;
+                try cursor.setOffset(buffer.*, selection.head);
+            },
+            .down => {
+                if (end_line + 1 >= buffer.lineCount()) return .none;
+                const other_end = if (end_line + 2 >= buffer.lineCount()) buffer.byteLen() else buffer.byteOffsetForLine(end_line + 2);
+                try self.swapLineBlocks(buffer, start, end, other_end);
+                const delta = other_end - end;
+                selection.anchor = original_anchor + delta;
+                selection.head = original_head + delta;
+                try cursor.setOffset(buffer.*, selection.head);
+            },
+        }
+        return .none;
+    }
+
+    fn swapLineBlocks(self: *State, buffer: *Buffer, first_start: usize, second_start: usize, second_end: usize) !void {
+        const first_len = second_start - first_start;
+        const second_len = second_end - second_start;
+        var replacement: std.ArrayListUnmanaged(u8) = .empty;
+        defer replacement.deinit(self.allocator);
+        try replacement.resize(self.allocator, first_len + second_len);
+        buffer.copyRange(replacement.items[0..second_len], second_start);
+        buffer.copyRange(replacement.items[second_len..], first_start);
+        try buffer.replace(first_start, second_end - first_start, replacement.items);
     }
 
     fn handleOperator(self: *State, buffer: *Buffer, cursor: *Cursor, operator: Operator) !Action {
@@ -518,6 +665,26 @@ fn rangeForMotion(start: usize, end: usize, motion: Motion) Buffer.ByteRange {
     if (motion == .line_end and end >= start) return .{ .start = start, .end = end };
     if (motion == .word_end and end >= start) return .{ .start = start, .end = end + 1 };
     return .{ .start = @min(start, end), .end = @max(start, end) };
+}
+
+pub fn selectedRange(buffer: Buffer, selection: Selection, linewise: bool) !Buffer.ByteRange {
+    if (linewise) {
+        const anchor_line = buffer.lineAt(selection.anchor);
+        const head_line = buffer.lineAt(selection.head);
+        const start_line = @min(anchor_line, head_line);
+        const end_line = @max(anchor_line, head_line);
+        return .{
+            .start = buffer.byteOffsetForLine(start_line),
+            .end = if (end_line + 1 >= buffer.lineCount()) buffer.byteLen() else buffer.byteOffsetForLine(end_line + 1),
+        };
+    }
+
+    const start = @min(selection.anchor, selection.head);
+    const max = @max(selection.anchor, selection.head);
+    var end_cursor = Cursor.at(buffer, max);
+    try end_cursor.moveRight(buffer);
+    const end = if (end_cursor.offset == max) @min(max + 1, buffer.byteLen()) else end_cursor.offset;
+    return .{ .start = start, .end = end };
 }
 
 fn clampRange(buffer: Buffer, range: Buffer.ByteRange) Buffer.ByteRange {
@@ -958,4 +1125,101 @@ test "vim substitute replace join and toggle commands" {
     const after_join = try buffer.toOwnedSlice(std.testing.allocator);
     defer std.testing.allocator.free(after_join);
     try std.testing.expectEqualStrings("zc def", after_join);
+}
+
+test "vim visual character yank and delete" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcdef");
+    defer buffer.deinit();
+    var cursor = Cursor.init(buffer);
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'l' });
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'y' });
+    try std.testing.expectEqualStrings("ab", vim.yank_register.text.items);
+
+    selection = Selection.fromCursor(cursor);
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'l' });
+    try std.testing.expectEqual(Action.exit_visual, try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'd' }));
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("adef", text);
+}
+
+test "vim visual line change uses full line range" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one\ntwo\nthree");
+    defer buffer.deinit();
+    var cursor = Cursor.init(buffer);
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, true, .{ .char = 'j' });
+    try std.testing.expectEqual(Action.enter_insert, try vim.handleVisual(&buffer, &cursor, &selection, true, .{ .char = 'c' }));
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("three", text);
+    try std.testing.expectEqualStrings("one\ntwo\n", vim.delete_register.text.items);
+}
+
+test "vim visual o swaps anchor and head" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcdef");
+    defer buffer.deinit();
+    var cursor = Cursor.init(buffer);
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'l' });
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'l' });
+    try std.testing.expectEqual(@as(usize, 0), selection.anchor);
+    try std.testing.expectEqual(@as(usize, 2), selection.head);
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'o' });
+    try std.testing.expectEqual(@as(usize, 2), selection.anchor);
+    try std.testing.expectEqual(@as(usize, 0), selection.head);
+    try std.testing.expectEqual(@as(usize, 0), cursor.offset);
+}
+
+test "vim visual paste replaces selection without clobbering yank register" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcdef");
+    defer buffer.deinit();
+    var cursor = Cursor.at(buffer, 1);
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+    try vim.yank_register.setFromRange(std.testing.allocator, buffer, .{ .start = 3, .end = 6 }, false);
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'l' });
+    try std.testing.expectEqual(Action.exit_visual, try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'p' }));
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("adefdef", text);
+    try std.testing.expectEqualStrings("def", vim.yank_register.text.items);
+    try std.testing.expectEqualStrings("bc", vim.delete_register.text.items);
+}
+
+test "vim visual J and K move selected lines" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one\ntwo\nthree\nfour\n");
+    defer buffer.deinit();
+    var cursor = Cursor.at(buffer, buffer.byteOffsetForLine(1));
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, true, .{ .char = 'J' });
+    const after_down = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(after_down);
+    try std.testing.expectEqualStrings("one\nthree\ntwo\nfour\n", after_down);
+    try std.testing.expectEqual(@as(usize, buffer.byteOffsetForLine(2)), cursor.offset);
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, true, .{ .char = 'K' });
+    const after_up = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(after_up);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour\n", after_up);
+    try std.testing.expectEqual(@as(usize, buffer.byteOffsetForLine(1)), cursor.offset);
 }

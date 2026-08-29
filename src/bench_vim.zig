@@ -16,6 +16,7 @@ pub fn main() !void {
     printStat("vim_delete_w_10k", try benchDeleteWord(allocator, 10_000), 10_000);
     printStat("vim_delete_line_10k", try benchDeleteLine(allocator, 10_000), 10_000);
     printStat("vim_delete_suffix_10k", try benchDeleteSuffix(allocator, 10_000), 10_000);
+    printStat("vim_visual_delete_10k", try benchVisualDelete(allocator, 10_000), 10_000);
     printStat("vim_paste_10k", try benchPaste(allocator, 10_000), 10_000);
     printStat("vim_open_line_10k", try benchOpenLine(allocator, 10_000), 10_000);
     printStat("vim_replace_10k", try benchReplace(allocator, 10_000), 10_000);
@@ -236,6 +237,32 @@ fn benchDeleteSuffix(allocator: std.mem.Allocator, iterations: usize) !u64 {
         for (0..iterations) |_| {
             _ = try vim.handleNormal(&buffer, &cursor, .{ .char = 'D' });
             _ = try vim.handleNormal(&buffer, &cursor, .{ .char = 'j' });
+        }
+        std.mem.doNotOptimizeAway(buffer.byteLen());
+        best = @min(best, elapsed(start));
+    }
+    return best;
+}
+
+fn benchVisualDelete(allocator: std.mem.Allocator, iterations: usize) !u64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..samples) |_| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
+        try fillWords(allocator, &text, iterations + 4);
+
+        var buffer = try nivi.Buffer.initFromText(allocator, text.items);
+        defer buffer.deinit();
+        var cursor = nivi.Cursor.init(buffer);
+        var selection = nivi.Selection.fromCursor(cursor);
+        var vim = nivi.vim.State.init(allocator);
+        defer vim.deinit();
+
+        const start = nowNanos();
+        for (0..iterations) |_| {
+            selection = nivi.Selection.fromCursor(cursor);
+            _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'w' });
+            _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'd' });
         }
         std.mem.doNotOptimizeAway(buffer.byteLen());
         best = @min(best, elapsed(start));
