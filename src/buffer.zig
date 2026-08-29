@@ -406,12 +406,16 @@ pub const Cursor = struct {
 
     pub fn moveLeft(self: *Cursor, buffer: Buffer) !void {
         try self.sync(buffer);
+        const line_start = buffer.rope.byteOffsetForLine(buffer.rope.lineAt(self.offset));
+        if (self.offset <= line_start) return;
         self.offset = try buffer.rope.prevGraphemeBoundary(self.offset);
         self.goal_column = null;
     }
 
     pub fn moveRight(self: *Cursor, buffer: Buffer) !void {
         try self.sync(buffer);
+        const content_end = buffer.lineContentRange(buffer.rope.lineAt(self.offset)).end;
+        if (self.offset >= content_end) return;
         self.offset = try buffer.rope.nextGraphemeBoundary(self.offset);
         self.goal_column = null;
     }
@@ -599,6 +603,27 @@ test "cursor moves by grapheme cluster" {
     try std.testing.expectEqual(@as(usize, 5), cursor.offset);
     try cursor.moveLeft(buffer);
     try std.testing.expectEqual(@as(usize, 1), cursor.offset);
+}
+
+test "cursor left and right stay within the current line" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "ab\ncd");
+    defer buffer.deinit();
+
+    // At the end of line 0 ("ab"), moveRight must not cross into line 1.
+    var cursor = Cursor.at(buffer, 2);
+    try cursor.moveRight(buffer);
+    try std.testing.expectEqual(@as(usize, 2), cursor.offset);
+
+    // At the start of line 1 ("cd", offset 3), moveLeft must not cross back up.
+    try cursor.setOffset(buffer, 3);
+    try cursor.moveLeft(buffer);
+    try std.testing.expectEqual(@as(usize, 3), cursor.offset);
+
+    // Within a line, movement still works.
+    try cursor.moveRight(buffer);
+    try std.testing.expectEqual(@as(usize, 4), cursor.offset);
+    try cursor.moveLeft(buffer);
+    try std.testing.expectEqual(@as(usize, 3), cursor.offset);
 }
 
 test "cursor line start and end" {
