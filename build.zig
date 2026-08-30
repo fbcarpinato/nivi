@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    linkTreeSitter(exe.root_module);
 
     b.installArtifact(exe);
 
@@ -42,6 +43,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    linkTreeSitter(bench.root_module);
 
     const bench_step = b.step("bench", "Run rope benchmarks");
     const bench_cmd = b.addRunArtifact(bench);
@@ -58,6 +60,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    linkTreeSitter(bench_undo.root_module);
 
     const bench_undo_step = b.step("bench-undo", "Run undo-tree benchmarks");
     const bench_undo_cmd = b.addRunArtifact(bench_undo);
@@ -74,6 +77,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    linkTreeSitter(bench_render.root_module);
 
     const bench_render_step = b.step("bench-render", "Run rendering/input benchmarks");
     const bench_render_cmd = b.addRunArtifact(bench_render);
@@ -90,6 +94,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    linkTreeSitter(bench_vim.root_module);
 
     const bench_vim_step = b.step("bench-vim", "Run Vim command engine benchmarks");
     const bench_vim_cmd = b.addRunArtifact(bench_vim);
@@ -98,14 +103,21 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    linkTreeSitter(mod_tests.root_module);
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    linkTreeSitter(exe_tests.root_module);
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+}
+
+fn linkTreeSitter(module: *std.Build.Module) void {
+    module.link_libc = true;
+    module.linkSystemLibrary("tree-sitter", .{});
 }

@@ -27,7 +27,7 @@ pub const RawMode = struct {
         raw.lflag.ISIG = false;
         raw.cflag.CSIZE = .CS8;
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
 
         try std.posix.tcsetattr(stdin_fd, .FLUSH, raw);
         return .{ .original = original, .enabled = true };

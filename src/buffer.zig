@@ -13,6 +13,12 @@ pub const Buffer = struct {
     pub const LineEnding = enum { lf, crlf };
     pub const BoundaryMode = Rope.BoundaryMode;
     pub const ByteRange = Rope.ByteRange;
+    pub const EditDelta = struct {
+        generation: u64,
+        offset: usize,
+        old_end: usize,
+        new_end: usize,
+    };
 
     rope: Rope,
     allocator: std.mem.Allocator,
@@ -23,6 +29,7 @@ pub const Buffer = struct {
     /// Reused scratch for the downward path in `jumpToState`.
     jump_scratch: std.ArrayListUnmanaged(*Node) = .empty,
     generation: u64 = 1,
+    last_edit: ?EditDelta = null,
     dirty: bool = false,
     line_ending: LineEnding = .lf,
     tab_width: usize = 4,
@@ -77,6 +84,18 @@ pub const Buffer = struct {
 
     fn touch(self: *Buffer) void {
         self.generation += 1;
+        self.last_edit = null;
+        self.dirty = true;
+    }
+
+    fn touchEdit(self: *Buffer, offset: usize, deleted_len: usize, inserted_len: usize) void {
+        self.generation += 1;
+        self.last_edit = .{
+            .generation = self.generation,
+            .offset = offset,
+            .old_end = offset + deleted_len,
+            .new_end = offset + inserted_len,
+        };
         self.dirty = true;
     }
 
@@ -141,14 +160,14 @@ pub const Buffer = struct {
         if (text.len == 0) return;
         try self.undo_tree.recordInsertion(offset, text);
         try self.rope.insert(offset, text);
-        self.touch();
+        self.touchEdit(offset, 0, text.len);
     }
 
     pub fn delete(self: *Buffer, offset: usize, len: usize) !void {
         if (len == 0) return;
         try self.recordDeletionRange(offset, len);
         try self.rope.delete(offset, len);
-        self.touch();
+        self.touchEdit(offset, len, 0);
     }
 
     pub fn replace(self: *Buffer, offset: usize, len: usize, text: []const u8) !void {
@@ -159,7 +178,7 @@ pub const Buffer = struct {
         try self.undo_tree.recordReplacement(offset, self.delete_scratch.items, text);
         if (len != 0) try self.rope.delete(offset, len);
         if (text.len != 0) try self.rope.insert(offset, text);
-        self.touch();
+        self.touchEdit(offset, len, text.len);
     }
 
     pub fn insertUtf8(self: *Buffer, offset: usize, text: []const u8, mode: BoundaryMode) !usize {
@@ -168,7 +187,7 @@ pub const Buffer = struct {
         if (text.len != 0) {
             try self.undo_tree.recordInsertion(at, text);
             try self.rope.insert(at, text);
-            self.touch();
+            self.touchEdit(at, 0, text.len);
         }
         return at;
     }
@@ -183,9 +202,10 @@ pub const Buffer = struct {
 
     /// Replace the whole buffer. Resets the undo tree (new file baseline).
     pub fn setText(self: *Buffer, text: []const u8) !void {
+        const old_len = self.byteLen();
         try self.rope.setText(text);
         try self.undo_tree.reset();
-        self.touch();
+        self.touchEdit(0, old_len, text.len);
     }
 
     pub fn markSaved(self: *Buffer) void {
@@ -301,7 +321,7 @@ pub const Buffer = struct {
     fn applyRaw(self: *Buffer, offset: usize, del_len: usize, ins_text: []const u8) !void {
         if (del_len != 0) try self.rope.delete(offset, del_len);
         if (ins_text.len != 0) try self.rope.insert(offset, ins_text);
-        self.touch();
+        self.touchEdit(offset, del_len, ins_text.len);
     }
 
     fn recordDeletionRange(self: *Buffer, offset: usize, len: usize) !void {
@@ -376,8 +396,8 @@ pub const Cursor = struct {
         }
     }
 
-    fn adoptRopeCursor(self: *Cursor, buffer: *Buffer) void {
-        buffer.touch();
+    fn adoptRopeCursor(self: *Cursor, buffer: *Buffer, offset: usize, deleted_len: usize, inserted_len: usize) void {
+        buffer.touchEdit(offset, deleted_len, inserted_len);
         self.offset = self.rope_cursor.offset;
         self.generation = buffer.generation;
         self.rope_cursor_generation = buffer.generation;
@@ -391,8 +411,9 @@ pub const Cursor = struct {
         try self.sync(buffer.*);
         try buffer.undo_tree.recordInsertion(self.offset, text);
         self.ensureRopeCursor(buffer);
+        const offset = self.offset;
         try buffer.rope.insertAtCursor(&self.rope_cursor, text);
-        self.adoptRopeCursor(buffer);
+        self.adoptRopeCursor(buffer, offset, 0, text.len);
     }
 
     /// Delete the grapheme cluster before the caret (Backspace).
@@ -403,7 +424,7 @@ pub const Cursor = struct {
         try buffer.recordDeletionRange(prev, self.offset - prev);
         self.ensureRopeCursor(buffer);
         try buffer.rope.deleteBeforeCursor(&self.rope_cursor, self.offset - prev);
-        self.adoptRopeCursor(buffer);
+        self.adoptRopeCursor(buffer, prev, self.offset - prev, 0);
     }
 
     /// Delete the grapheme cluster at the caret (Delete).
@@ -413,8 +434,9 @@ pub const Cursor = struct {
         const next = try buffer.rope.nextGraphemeBoundary(self.offset);
         try buffer.recordDeletionRange(self.offset, next - self.offset);
         self.ensureRopeCursor(buffer);
+        const offset = self.offset;
         try buffer.rope.deleteAtCursor(&self.rope_cursor, next - self.offset);
-        self.adoptRopeCursor(buffer);
+        self.adoptRopeCursor(buffer, offset, next - offset, 0);
     }
 
     pub fn line(self: *Cursor, buffer: Buffer) !usize {

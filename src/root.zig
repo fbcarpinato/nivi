@@ -7,6 +7,7 @@ pub const render = @import("render.zig");
 pub const input = @import("input.zig");
 pub const terminal = @import("terminal.zig");
 pub const vim = @import("vim.zig");
+pub const syntax = @import("syntax.zig");
 
 test {
     _ = @import("rope.zig");
@@ -16,4 +17,5 @@ test {
     _ = @import("input.zig");
     _ = @import("terminal.zig");
     _ = @import("vim.zig");
+    _ = @import("syntax.zig");
 }

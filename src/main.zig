@@ -9,6 +9,8 @@ const Key = nivi.input.Key;
 const Rect = nivi.render.Rect;
 
 const Mode = enum { normal, insert, command, visual, visual_line };
+const syntax_debounce_ns = 25 * std.time.ns_per_ms;
+const frame_timeout_ms = 16;
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +19,7 @@ const App = struct {
     cursor: Cursor,
     selection: Selection,
     vim: nivi.vim.State,
+    syntax: nivi.syntax.Highlighter,
     mode: Mode = .normal,
     first_line: usize = 0,
     first_column: usize = 0,
@@ -26,13 +29,22 @@ const App = struct {
     command: std.ArrayListUnmanaged(u8) = .empty,
     message: std.ArrayListUnmanaged(u8) = .empty,
     render_scratch: std.ArrayListUnmanaged(u8) = .empty,
+    syntax_source: std.ArrayListUnmanaged(u8) = .empty,
+    syntax_highlights: std.ArrayListUnmanaged(nivi.syntax.HighlightSpan) = .empty,
+    syntax_generation: u64 = 0,
+    syntax_visible: nivi.syntax.ByteRange = .{ .start = 0, .end = 0 },
+    syntax_refresh_after_ns: i128 = 0,
+    needs_render: bool = true,
     should_quit: bool = false,
 
     fn deinit(self: *App) void {
+        self.syntax.deinit();
         self.vim.deinit();
         self.command.deinit(self.allocator);
         self.message.deinit(self.allocator);
         self.render_scratch.deinit(self.allocator);
+        self.syntax_source.deinit(self.allocator);
+        self.syntax_highlights.deinit(self.allocator);
     }
 
     fn setMessage(self: *App, comptime fmt: []const u8, args: anytype) !void {
@@ -43,12 +55,17 @@ const App = struct {
     }
 
     fn handleKey(self: *App, key: Key) !void {
+        const before_generation = self.buffer.generation;
         switch (self.mode) {
             .normal => try self.handleNormal(key),
             .insert => try self.handleInsert(key),
             .command => try self.handleCommand(key),
             .visual, .visual_line => try self.handleVisual(key),
         }
+        if (self.buffer.generation != before_generation) {
+            self.syntax_refresh_after_ns = monotonicNowNs() + syntax_debounce_ns;
+        }
+        self.needs_render = true;
         try self.keepCursorVisible();
     }
 
@@ -204,7 +221,62 @@ const App = struct {
         };
     }
 
-    fn render(self: *App, frame: *nivi.render.FrameRenderer) !void {
+    fn renderHighlights(self: *App, visible: nivi.syntax.ByteRange, now_ns: i128) !?[]const nivi.syntax.HighlightSpan {
+        if (!self.syntax.enabled()) return null;
+        if (self.syntax_generation == self.buffer.generation) {
+            if (std.meta.eql(self.syntax_visible, visible)) return self.syntax_highlights.items;
+            self.syntax_highlights.clearRetainingCapacity();
+            try self.syntax.collectVisible(&self.syntax_highlights, visible);
+            self.syntax_visible = visible;
+            return self.syntax_highlights.items;
+        }
+        if (self.syntax_generation != 0 and now_ns < self.syntax_refresh_after_ns) return self.syntax_highlights.items;
+
+        self.syntax_highlights.clearRetainingCapacity();
+        if (self.syntax_generation != 0 and self.syntax_generation + 1 == self.buffer.generation and self.buffer.last_edit != null and self.buffer.last_edit.?.generation == self.buffer.generation) {
+            const edit = self.buffer.last_edit.?;
+            const inserted_len = edit.new_end - edit.offset;
+            self.syntax_source.clearRetainingCapacity();
+            try self.syntax_source.resize(self.allocator, inserted_len);
+            if (inserted_len != 0) self.buffer.copyRange(self.syntax_source.items, edit.offset);
+            try self.syntax.collectEdit(&self.syntax_highlights, .{
+                .offset = edit.offset,
+                .old_end = edit.old_end,
+                .new_end = edit.new_end,
+                .inserted = self.syntax_source.items,
+            }, visible);
+        } else {
+            self.syntax_source.clearRetainingCapacity();
+            try self.syntax_source.resize(self.allocator, self.buffer.byteLen());
+            self.buffer.copyRange(self.syntax_source.items, 0);
+            try self.syntax.collectFull(&self.syntax_highlights, self.syntax_source.items, visible);
+        }
+        self.syntax_generation = self.buffer.generation;
+        self.syntax_visible = visible;
+        return self.syntax_highlights.items;
+    }
+
+    fn syntaxRefreshDue(self: App, now_ns: i128) bool {
+        return self.syntax.enabled() and self.syntax_generation != 0 and self.syntax_generation != self.buffer.generation and now_ns >= self.syntax_refresh_after_ns;
+    }
+
+    fn pollTimeoutMs(self: App, now_ns: i128) i32 {
+        if (!self.syntax.enabled() or self.syntax_generation == 0 or self.syntax_generation == self.buffer.generation) return frame_timeout_ms;
+        if (now_ns >= self.syntax_refresh_after_ns) return 0;
+        const remaining_ns = self.syntax_refresh_after_ns - now_ns;
+        const remaining_ms = @max(@as(i128, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        return @intCast(@min(@as(i128, frame_timeout_ms), remaining_ms));
+    }
+
+    fn visibleByteRange(self: App, area: Rect) nivi.syntax.ByteRange {
+        const start_line = @min(self.first_line, self.buffer.lineCount() - 1);
+        const end_line = @min(self.buffer.lineCount(), start_line + area.height);
+        const start = self.buffer.byteOffsetForLine(start_line);
+        const end = if (end_line >= self.buffer.lineCount()) self.buffer.byteLen() else self.buffer.byteOffsetForLine(end_line);
+        return .{ .start = start, .end = end };
+    }
+
+    fn render(self: *App, frame: *nivi.render.FrameRenderer, now_ns: i128) !void {
         try self.refreshCursorMetrics();
         frame.beginFrame(.{});
         const screen = frame.current.rect();
@@ -214,6 +286,7 @@ const App = struct {
         const status_area = status_split.first;
         const command_area = command_split.first;
         self.editor_area = editor_area;
+        const highlights = try self.renderHighlights(self.visibleByteRange(editor_area), now_ns);
 
         try nivi.render.renderBufferViewportScratch(self.allocator, &self.render_scratch, &frame.current, editor_area, self.buffer.*, .{
             .first_line = self.first_line,
@@ -221,12 +294,14 @@ const App = struct {
             .cursor_line = self.cursor_line,
             .relative_line_numbers = true,
             .selection = try self.renderSelection(),
+            .highlights = highlights,
         });
         try frame.markDirty(editor_area);
         self.renderStatus(&frame.current, status_area);
         try frame.markDirty(status_area);
         self.renderCommand(&frame.current, command_area);
         try frame.markDirty(command_area);
+        self.needs_render = false;
     }
 
     fn placeTerminalCursor(self: *App, writer: *Io.Writer, screen: Rect) !void {
@@ -287,6 +362,12 @@ const App = struct {
         }
     }
 };
+
+fn monotonicNowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -350,7 +431,15 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var frame = try nivi.render.FrameRenderer.init(allocator, size.width, size.height);
     defer frame.deinit();
 
-    var app: App = .{ .allocator = allocator, .io = io, .buffer = buffer, .cursor = Cursor.init(buffer.*), .selection = Selection.init(buffer.*), .vim = nivi.vim.State.init(allocator) };
+    var app: App = .{
+        .allocator = allocator,
+        .io = io,
+        .buffer = buffer,
+        .cursor = Cursor.init(buffer.*),
+        .selection = Selection.init(buffer.*),
+        .vim = nivi.vim.State.init(allocator),
+        .syntax = try nivi.syntax.Highlighter.init(allocator, buffer.path),
+    };
     defer app.deinit();
 
     // Bytes read but not yet consumed (an escape/UTF-8 sequence split across
@@ -360,20 +449,27 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var pending_len: usize = 0;
     var read_buf: [256]u8 = undefined;
     while (!app.should_quit) {
-        try app.render(&frame);
-        try nivi.render.AnsiRenderer.hideCursor(stdout);
-        try frame.present(stdout);
-        try app.placeTerminalCursor(stdout, frame.current.rect());
-        try stdout.flush();
+        const now_ns = monotonicNowNs();
+        if (app.needs_render or app.syntaxRefreshDue(now_ns)) {
+            try app.render(&frame, now_ns);
+            try nivi.render.AnsiRenderer.hideCursor(stdout);
+            try frame.present(stdout);
+            try app.placeTerminalCursor(stdout, frame.current.rect());
+            try stdout.flush();
+        }
 
-        const n = try std.posix.read(std.posix.STDIN_FILENO, &read_buf);
-        if (n == 0) {
-            // Timeout with a lone pending ESC resolves to an Escape keypress;
+        var poll_fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&poll_fds, app.pollTimeoutMs(monotonicNowNs()));
+        if (ready == 0) {
+            // A lone pending ESC resolves to an Escape keypress after one frame;
             // any other stale partial sequence is dropped.
             if (pending_len == 1 and pending[0] == 0x1b) try app.handleKey(.escape);
             pending_len = 0;
             continue;
         }
+
+        const n = try std.posix.read(std.posix.STDIN_FILENO, &read_buf);
+        if (n == 0) continue;
 
         const copy = @min(n, pending.len - pending_len);
         @memcpy(pending[pending_len..][0..copy], read_buf[0..copy]);

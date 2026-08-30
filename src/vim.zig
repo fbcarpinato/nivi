@@ -757,8 +757,8 @@ fn nextParagraph(buffer: Buffer, offset: usize, repeat: usize) usize {
     var n: usize = 0;
     while (n < repeat) : (n += 1) {
         if (at >= buffer.byteLen()) return buffer.byteLen();
-        at = findNextBlankLine(buffer, at + 1);
-        at = skipBlankLinesForward(buffer, at);
+        const line = buffer.lineAt(at);
+        at = findNextBlankLineFrom(buffer, line + 1);
     }
     return at;
 }
@@ -768,24 +768,26 @@ fn prevParagraph(buffer: Buffer, offset: usize, repeat: usize) usize {
     var n: usize = 0;
     while (n < repeat) : (n += 1) {
         if (at == 0) return 0;
-        at = skipBlankLinesBackward(buffer, at);
-        at = findPrevBlankLine(buffer, at);
+        const line = buffer.lineAt(at);
+        if (line == 0) return 0;
+        at = findPrevBlankLineBefore(buffer, line);
     }
     return at;
 }
 
-fn findNextBlankLine(buffer: Buffer, offset: usize) usize {
-    var line = buffer.lineAt(@min(offset, buffer.byteLen()));
+fn findNextBlankLineFrom(buffer: Buffer, first_line: usize) usize {
+    var line = first_line;
     while (line < buffer.lineCount()) : (line += 1) {
         if (isBlankLine(buffer, line)) return buffer.byteOffsetForLine(line);
     }
     return buffer.byteLen();
 }
 
-fn findPrevBlankLine(buffer: Buffer, offset: usize) usize {
-    var line = buffer.lineAt(offset - 1);
+fn findPrevBlankLineBefore(buffer: Buffer, before_line: usize) usize {
+    if (before_line == 0) return 0;
+    var line = before_line - 1;
     while (true) {
-        if (isBlankLine(buffer, line)) return if (line + 1 >= buffer.lineCount()) buffer.byteLen() else buffer.byteOffsetForLine(line + 1);
+        if (isBlankLine(buffer, line)) return buffer.byteOffsetForLine(line);
         if (line == 0) return 0;
         line -= 1;
     }
@@ -1079,16 +1081,19 @@ test "vim fast paragraph and half page movements" {
     defer vim.deinit();
 
     _ = try vim.handleNormal(&buffer, &cursor, .{ .char = '}' });
-    try std.testing.expectEqual(@as(usize, 5), cursor.offset);
+    try std.testing.expectEqual(@as(usize, 4), cursor.offset);
     _ = try vim.handleNormal(&buffer, &cursor, .{ .char = '}' });
-    try std.testing.expectEqual(@as(usize, 16), cursor.offset);
+    try std.testing.expectEqual(@as(usize, 15), cursor.offset);
     _ = try vim.handleNormal(&buffer, &cursor, .{ .char = '{' });
-    try std.testing.expectEqual(@as(usize, 5), cursor.offset);
+    try std.testing.expectEqual(@as(usize, 4), cursor.offset);
+    _ = try vim.handleNormal(&buffer, &cursor, .{ .char = '{' });
+    try std.testing.expectEqual(@as(usize, 0), cursor.offset);
 
+    try cursor.setOffset(buffer, 4);
     _ = try vim.handleNormal(&buffer, &cursor, .{ .ctrl = 'n' });
-    try std.testing.expectEqual(@as(usize, 16), cursor.offset);
+    try std.testing.expectEqual(@as(usize, 15), cursor.offset);
     _ = try vim.handleNormal(&buffer, &cursor, .{ .ctrl = 'p' });
-    try std.testing.expectEqual(@as(usize, 5), cursor.offset);
+    try std.testing.expectEqual(@as(usize, 4), cursor.offset);
 
     _ = try vim.handleNormal(&buffer, &cursor, .{ .ctrl = 'd' });
     try std.testing.expectEqual(@as(usize, buffer.byteOffsetForLine(buffer.lineCount() - 1)), cursor.offset);
@@ -1182,6 +1187,27 @@ test "vim visual o swaps anchor and head" {
     try std.testing.expectEqual(@as(usize, 2), selection.anchor);
     try std.testing.expectEqual(@as(usize, 0), selection.head);
     try std.testing.expectEqual(@as(usize, 0), cursor.offset);
+}
+
+test "vim visual paragraph motions match vim boundaries" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one\n\ntwo\nthree\n\nfour");
+    defer buffer.deinit();
+    var cursor = Cursor.at(buffer, buffer.byteOffsetForLine(2));
+    var selection = Selection.fromCursor(cursor);
+    var vim = State.init(std.testing.allocator);
+    defer vim.deinit();
+
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = '}' });
+    try std.testing.expectEqual(@as(usize, buffer.byteOffsetForLine(4)), cursor.offset);
+    try std.testing.expectEqual(Action.exit_visual, try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'y' }));
+    try std.testing.expectEqualStrings("two\nthree\n\n", vim.yank_register.text.items);
+
+    try cursor.setOffset(buffer, buffer.byteOffsetForLine(3));
+    selection = Selection.fromCursor(cursor);
+    _ = try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = '{' });
+    try std.testing.expectEqual(@as(usize, buffer.byteOffsetForLine(1)), cursor.offset);
+    try std.testing.expectEqual(Action.exit_visual, try vim.handleVisual(&buffer, &cursor, &selection, false, .{ .char = 'y' }));
+    try std.testing.expectEqualStrings("\ntwo\nt", vim.yank_register.text.items);
 }
 
 test "vim visual paste replaces selection without clobbering yank register" {

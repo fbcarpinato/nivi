@@ -29,11 +29,14 @@
             zig
             zls
             pkg-config
+            tree-sitter
+            tree-sitter-grammars.tree-sitter-zig
           ];
 
           shellHook = ''
             export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global"
             export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/local"
+            export TREE_SITTER_ZIG_PARSER="${pkgs.tree-sitter-grammars.tree-sitter-zig}/parser"
             echo "nivi dev shell: zig $(zig version)"
           '';
         };

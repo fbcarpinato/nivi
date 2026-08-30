@@ -237,7 +237,7 @@ Ordered roughly by expected impact. None of these are implemented yet.
 - [ ] `undolevels`-style cap: prune oldest branches to bound memory.
 - [ ] Persist the undo tree to disk (nvim-style `undofile`).
 - [ ] `.`-repeat: record the last change command for replay.
-- [ ] Change events / edit deltas for observers (highlighting, diagnostics).
+- [x] Last-edit delta for observers (syntax highlighting can avoid full diffing).
 
 ### Unicode completeness (needs generated UCD tables)
 - [ ] UAX #29 grapheme break tables (replace heuristics; add `GraphemeBreakTest.txt` conformance).
@@ -269,9 +269,23 @@ Ordered roughly by expected impact. None of these are implemented yet.
 - [x] Incremental invalidation via dirty rects (`FrameRenderer.markDirty` +
       `AnsiRenderer.renderDiffRects`); the editor loop marks editor/status/command
       regions so present only scans changed regions.
+- [x] Syntax/highlight spans layered over viewport cells (first-pass Tree-sitter Zig support).
 - [ ] Component scheduler with focus, z-order traversal, and command routing.
 - [ ] Per-component dirty tracking driven by buffer generation ranges.
-- [ ] Syntax/highlight spans layered over viewport cells.
+
+### Syntax architecture
+- [x] Tree-sitter runtime wrapper for parser/tree/node ownership.
+- [x] Zig proof-of-concept: dynamic grammar loading, incremental edits, viewport-scoped highlight spans.
+- [ ] Split syntax into language-agnostic runtime + language registry + document syntax state.
+- [ ] Replace Zig node-kind matching with Tree-sitter highlight queries (`queries/highlights.scm`).
+- [ ] Map query captures (`@keyword`, `@string`, `@comment`, `@function`, `@type`, etc.) to renderer styles.
+- [ ] Load parser/query paths from data-driven language configs instead of hardcoded Zig-specific logic.
+- [ ] Support a user/runtime grammar directory (for example `~/.local/share/nivi/parsers/*.so`).
+- [ ] Keep syntax work off the input/render critical path via a worker or cooperative time budget.
+
+Long-term shape: `Buffer` emits text edits, `DocumentSyntax` consumes edits and owns the
+Tree-sitter tree/source mirror, a `LanguageRegistry` resolves filetypes to parser + query
+config, and the renderer only consumes language-independent highlight spans.
 
 ### Robustness / production
 - [ ] Fuzz tests (`std.testing.fuzz`) for edits and Unicode boundaries.

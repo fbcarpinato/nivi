@@ -1,5 +1,6 @@
 const std = @import("std");
 const Buffer = @import("buffer.zig").Buffer;
+const syntax = @import("syntax.zig");
 
 pub const Color = enum(u8) {
     default,
@@ -7,6 +8,12 @@ pub const Color = enum(u8) {
     status,
     selection,
     accent,
+    syntax_keyword,
+    syntax_string,
+    syntax_comment,
+    syntax_number,
+    syntax_builtin,
+    syntax_type,
 };
 
 pub const Style = struct {
@@ -364,6 +371,12 @@ pub const AnsiRenderer = struct {
             .status => base + 4,
             .selection => base + 6,
             .accent => base + 2,
+            .syntax_keyword => base + 5,
+            .syntax_string => base + 2,
+            .syntax_comment => base + 8,
+            .syntax_number => base + 3,
+            .syntax_builtin => base + 1,
+            .syntax_type => base + 4,
         };
         if (code) |value| try writer.print(";{d}", .{value});
     }
@@ -422,6 +435,7 @@ pub const ViewportOptions = struct {
     gutter_width: usize = 0,
     tab_width: usize = 4,
     selection: ?Buffer.ByteRange = null,
+    highlights: ?[]const syntax.HighlightSpan = null,
 };
 
 pub fn gutterWidth(buffer: Buffer) usize {
@@ -479,7 +493,7 @@ pub fn renderBufferViewportScratch(
         const copy_len = @min(line_len, (options.first_column + text_width) * 4 + 16);
         try scratch.resize(allocator, copy_len);
         buffer.copyRange(scratch.items, range.start);
-        renderLineText(surface, text_x, y, text_width, options.first_column, scratch.items, range.start, options.selection, options.tab_width);
+        renderLineText(surface, text_x, y, text_width, options.first_column, scratch.items, range.start, options.selection, options.highlights, options.tab_width);
     }
 }
 
@@ -501,7 +515,7 @@ fn distance(a: usize, b: usize) usize {
     return if (a > b) a - b else b - a;
 }
 
-fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_column: usize, text: []const u8, line_start: usize, selection: ?Buffer.ByteRange, tab_width: usize) void {
+fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_column: usize, text: []const u8, line_start: usize, selection: ?Buffer.ByteRange, highlights: ?[]const syntax.HighlightSpan, tab_width: usize) void {
     // `col` is the line's visual column; only columns in [first_column,
     // first_column + width) are drawn, at surface x + (col - first_column).
     var col: usize = 0;
@@ -509,7 +523,7 @@ fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_col
     const end_col = first_column + width;
     while (index < text.len and col < end_col) {
         const byte = text[index];
-        const style = styleForByte(line_start + index, selection);
+        const style = styleForByte(line_start + index, selection, highlights);
         if (byte == '\t') {
             const spaces = @max(@as(usize, 1), tab_width - (col % tab_width));
             var n: usize = 0;
@@ -558,10 +572,42 @@ fn renderLineText(surface: *Surface, x: usize, y: usize, width: usize, first_col
     }
 }
 
-fn styleForByte(offset: usize, selection: ?Buffer.ByteRange) Style {
-    const range = selection orelse return .{};
-    if (offset >= range.start and offset < range.end) return .{ .bg = .selection };
-    return .{};
+fn styleForByte(offset: usize, selection: ?Buffer.ByteRange, highlights: ?[]const syntax.HighlightSpan) Style {
+    var style: Style = .{};
+    if (highlightForByte(offset, highlights)) |kind| style.fg = colorForHighlight(kind);
+    if (selection) |range| {
+        if (offset >= range.start and offset < range.end) style.bg = .selection;
+    }
+    return style;
+}
+
+fn highlightForByte(offset: usize, highlights: ?[]const syntax.HighlightSpan) ?syntax.HighlightKind {
+    const spans = highlights orelse return null;
+    var left: usize = 0;
+    var right: usize = spans.len;
+    while (left < right) {
+        const mid = left + (right - left) / 2;
+        const span = spans[mid];
+        if (offset < span.start) {
+            right = mid;
+        } else if (offset >= span.end) {
+            left = mid + 1;
+        } else {
+            return span.kind;
+        }
+    }
+    return null;
+}
+
+fn colorForHighlight(kind: syntax.HighlightKind) Color {
+    return switch (kind) {
+        .keyword => .syntax_keyword,
+        .string => .syntax_string,
+        .comment => .syntax_comment,
+        .number => .syntax_number,
+        .builtin => .syntax_builtin,
+        .type => .syntax_type,
+    };
 }
 
 fn utf8Len(first: u8) ?usize {
@@ -765,6 +811,23 @@ test "viewport highlights selected bytes" {
     try std.testing.expectEqual(Color.selection, surface.cellAt(1, 0).style.bg);
     try std.testing.expectEqual(Color.selection, surface.cellAt(2, 0).style.bg);
     try std.testing.expectEqual(Color.default, surface.cellAt(3, 0).style.bg);
+}
+
+test "viewport applies syntax highlight spans" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "const x = 1");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 11, 1);
+    defer surface.deinit();
+
+    const highlights = [_]syntax.HighlightSpan{.{ .start = 0, .end = 5, .kind = .keyword }};
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{
+        .line_numbers = false,
+        .highlights = &highlights,
+    });
+
+    try std.testing.expectEqual(Color.syntax_keyword, surface.cellAt(0, 0).style.fg);
+    try std.testing.expectEqual(Color.syntax_keyword, surface.cellAt(4, 0).style.fg);
+    try std.testing.expectEqual(Color.default, surface.cellAt(5, 0).style.fg);
 }
 
 test "viewport renders wide unicode using display columns" {
