@@ -100,6 +100,23 @@ pub fn build(b: *std.Build) void {
     const bench_vim_cmd = b.addRunArtifact(bench_vim);
     bench_vim_step.dependOn(&bench_vim_cmd.step);
 
+    const bench_syntax = b.addExecutable(.{
+        .name = "bench-syntax",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_syntax.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nivi", .module = mod },
+            },
+        }),
+    });
+    linkTreeSitter(bench_syntax.root_module);
+
+    const bench_syntax_step = b.step("bench-syntax", "Run incremental syntax benchmarks");
+    const bench_syntax_cmd = b.addRunArtifact(bench_syntax);
+    bench_syntax_step.dependOn(&bench_syntax_cmd.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

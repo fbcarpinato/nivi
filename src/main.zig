@@ -14,8 +14,67 @@ const LeaderState = enum { none, leader, leader_u };
 const UndoDirection = enum { up, down };
 const syntax_debounce_ns: i128 = 25 * std.time.ns_per_ms;
 const insert_syntax_idle_ns: i128 = 100 * std.time.ns_per_ms;
+const syntax_budget_ns: u64 = 2 * std.time.ns_per_ms;
+const syntax_recovery_samples = 3;
 const frame_timeout_ms = 16;
 const undo_panel_width = 32;
+
+const SyntaxLatency = struct {
+    const capacity = 128;
+
+    samples: [capacity]u64 = .{0} ** capacity,
+    count: usize = 0,
+    next: usize = 0,
+    total_ns: u128 = 0,
+    max_ns: u64 = 0,
+    over_budget: u64 = 0,
+
+    fn record(self: *SyntaxLatency, elapsed_ns: u64) void {
+        if (self.count == capacity) {
+            self.total_ns -= self.samples[self.next];
+        } else {
+            self.count += 1;
+        }
+        self.samples[self.next] = elapsed_ns;
+        self.next = (self.next + 1) % capacity;
+        self.total_ns += elapsed_ns;
+        self.max_ns = @max(self.max_ns, elapsed_ns);
+        if (elapsed_ns > syntax_budget_ns) self.over_budget += 1;
+    }
+
+    fn averageNs(self: SyntaxLatency) u64 {
+        return if (self.count == 0) 0 else @intCast(self.total_ns / self.count);
+    }
+
+    fn percentileNs(self: SyntaxLatency, percentile: u8) u64 {
+        if (self.count == 0) return 0;
+        var sorted: [capacity]u64 = undefined;
+        @memcpy(sorted[0..self.count], self.samples[0..self.count]);
+        std.mem.sort(u64, sorted[0..self.count], {}, std.sort.asc(u64));
+        const rank = (@as(usize, percentile) * (self.count - 1) + 99) / 100;
+        return sorted[@min(rank, self.count - 1)];
+    }
+};
+
+const SyntaxScheduler = struct {
+    latency: SyntaxLatency = .{},
+    defer_until_idle: bool = false,
+    fast_streak: u8 = 0,
+
+    fn record(self: *SyntaxScheduler, elapsed_ns: u64) void {
+        self.latency.record(elapsed_ns);
+        if (elapsed_ns > syntax_budget_ns) {
+            self.defer_until_idle = true;
+            self.fast_streak = 0;
+        } else if (self.defer_until_idle) {
+            self.fast_streak +|= 1;
+            if (self.fast_streak >= syntax_recovery_samples) {
+                self.defer_until_idle = false;
+                self.fast_streak = 0;
+            }
+        }
+    }
+};
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -36,10 +95,12 @@ const App = struct {
     render_scratch: std.ArrayListUnmanaged(u8) = .empty,
     indent_scratch: std.ArrayListUnmanaged(u8) = .empty,
     syntax_highlights: std.ArrayListUnmanaged(nivi.syntax.HighlightSpan) = .empty,
+    syntax_highlights_back: std.ArrayListUnmanaged(nivi.syntax.HighlightSpan) = .empty,
     syntax_generation: u64 = 0,
     syntax_highlight_generation: u64 = 0,
     syntax_visible: nivi.syntax.ByteRange = .{ .start = 0, .end = 0 },
     syntax_refresh_after_ns: i128 = 0,
+    syntax_scheduler: SyntaxScheduler = .{},
     needs_render: bool = true,
     focus: Focus = .editor,
     leader: LeaderState = .none,
@@ -59,6 +120,7 @@ const App = struct {
         self.render_scratch.deinit(self.allocator);
         self.indent_scratch.deinit(self.allocator);
         self.syntax_highlights.deinit(self.allocator);
+        self.syntax_highlights_back.deinit(self.allocator);
         self.undo_rows.deinit(self.allocator);
     }
 
@@ -86,16 +148,14 @@ const App = struct {
             }
         }
         if (self.buffer.generation != before_generation) {
-            const delay = if (self.mode == .insert) insert_syntax_idle_ns else syntax_debounce_ns;
-            self.syntax_refresh_after_ns = monotonicNowNs() + delay;
             if (self.buffer.generation == before_generation + 1) {
                 self.adjustSyntaxHighlightsForLastEdit(before_generation);
+                const delay = if (self.mode == .insert) insert_syntax_idle_ns else syntax_debounce_ns;
+                self.syntax_refresh_after_ns = if (self.syntax_scheduler.defer_until_idle) monotonicNowNs() + delay else 0;
             } else {
-                self.syntax_highlights.clearRetainingCapacity();
-                self.syntax_highlight_generation = self.buffer.generation;
                 // Multi-edit commands cannot be remapped from only `last_edit`.
-                // Rebuild before the next frame instead of briefly drawing an
-                // unhighlighted viewport during the insert-mode debounce.
+                // Rebuild before the next frame while the front-buffered spans
+                // remain visible; only a complete replacement is swapped in.
                 self.syntax_refresh_after_ns = 0;
             }
         }
@@ -500,6 +560,17 @@ const App = struct {
         } else if (std.mem.eql(u8, cmd, "wq") or std.mem.eql(u8, cmd, "x")) {
             try self.buffer.save(self.io);
             self.should_quit = true;
+        } else if (std.mem.eql(u8, cmd, "syntax")) {
+            const latency = self.syntax_scheduler.latency;
+            try self.setMessage("syntax n={d} avg={d}us p50={d}us p99={d}us max={d}us slow={d} mode={s}", .{
+                latency.count,
+                latency.averageNs() / std.time.ns_per_us,
+                latency.percentileNs(50) / std.time.ns_per_us,
+                latency.percentileNs(99) / std.time.ns_per_us,
+                latency.max_ns / std.time.ns_per_us,
+                latency.over_budget,
+                if (self.syntax_scheduler.defer_until_idle) "idle" else "immediate",
+            });
         } else {
             try self.setMessage("not an editor command: {s}", .{cmd});
         }
@@ -539,33 +610,80 @@ const App = struct {
         if (!self.syntax.enabled()) return null;
         if (self.syntax_generation == self.buffer.generation) {
             if (self.syntax_highlight_generation == self.buffer.generation and std.meta.eql(self.syntax_visible, visible)) return self.syntax_highlights.items;
-            self.syntax_highlights.clearRetainingCapacity();
-            try self.syntax.collectVisible(&self.syntax_highlights, self.buffer, visible);
-            self.syntax_highlight_generation = self.buffer.generation;
-            self.syntax_visible = visible;
+            try self.rebuildVisibleHighlights(visible);
             return self.syntax_highlights.items;
         }
-        if (self.mode == .insert and self.syntax_highlight_generation == self.buffer.generation and now_ns < self.syntax_refresh_after_ns) return self.syntax_highlights.items;
         if (self.syntax_generation != 0 and now_ns < self.syntax_refresh_after_ns) return self.syntax_highlights.items;
 
-        if (self.syntax_generation != 0 and self.syntax_generation + 1 == self.buffer.generation and self.buffer.last_edit != null and self.buffer.last_edit.?.generation == self.buffer.generation) {
+        const started_ns = monotonicNowNs();
+        self.syntax_highlights_back.clearRetainingCapacity();
+        const incremental = self.syntax_generation != 0 and self.syntax_generation + 1 == self.buffer.generation and self.buffer.last_edit != null and self.buffer.last_edit.?.generation == self.buffer.generation;
+        const budget_ns: ?u64 = if (self.syntax_generation != 0 and !self.syntax_scheduler.defer_until_idle) syntax_budget_ns else null;
+        if (incremental) {
+            try self.syntax_highlights_back.appendSlice(self.allocator, self.syntax_highlights.items);
             const edit = self.buffer.last_edit.?;
-            try self.syntax.collectEdit(&self.syntax_highlights, self.buffer, .{
+            self.syntax.collectEditBudgeted(&self.syntax_highlights_back, self.buffer, .{
                 .offset = edit.offset,
                 .old_end = edit.old_end,
                 .new_end = edit.new_end,
                 .start_point = .{ .row = edit.start_point.row, .column = edit.start_point.column },
                 .old_end_point = .{ .row = edit.old_end_point.row, .column = edit.old_end_point.column },
                 .new_end_point = .{ .row = edit.new_end_point.row, .column = edit.new_end_point.column },
-            }, visible);
+            }, visible, budget_ns) catch |err| switch (err) {
+                error.ParseCancelled => {
+                    self.deferSyntaxRefresh(started_ns);
+                    return self.syntax_highlights.items;
+                },
+                else => return err,
+            };
+            if (!std.meta.eql(self.syntax_visible, visible)) {
+                self.syntax_highlights_back.clearRetainingCapacity();
+                try self.syntax.collectVisible(&self.syntax_highlights_back, self.buffer, visible);
+            }
         } else {
-            self.syntax_highlights.clearRetainingCapacity();
-            try self.syntax.collectFull(&self.syntax_highlights, self.buffer, visible);
+            self.syntax.collectFullBudgeted(&self.syntax_highlights_back, self.buffer, visible, budget_ns) catch |err| switch (err) {
+                error.ParseCancelled => {
+                    self.deferSyntaxRefresh(started_ns);
+                    return self.syntax_highlights.items;
+                },
+                else => return err,
+            };
         }
+
+        self.swapSyntaxHighlights();
         self.syntax_generation = self.buffer.generation;
         self.syntax_highlight_generation = self.buffer.generation;
         self.syntax_visible = visible;
+        self.recordSyntaxLatency(started_ns);
         return self.syntax_highlights.items;
+    }
+
+    fn rebuildVisibleHighlights(self: *App, visible: nivi.syntax.ByteRange) !void {
+        const started_ns = monotonicNowNs();
+        self.syntax_highlights_back.clearRetainingCapacity();
+        try self.syntax.collectVisible(&self.syntax_highlights_back, self.buffer, visible);
+        self.swapSyntaxHighlights();
+        self.syntax_highlight_generation = self.buffer.generation;
+        self.syntax_visible = visible;
+        self.recordSyntaxLatency(started_ns);
+    }
+
+    fn swapSyntaxHighlights(self: *App) void {
+        std.mem.swap(std.ArrayListUnmanaged(nivi.syntax.HighlightSpan), &self.syntax_highlights, &self.syntax_highlights_back);
+    }
+
+    fn recordSyntaxLatency(self: *App, started_ns: i128) void {
+        const finished_ns = monotonicNowNs();
+        const elapsed_ns: u64 = if (finished_ns > started_ns) @intCast(@min(finished_ns - started_ns, std.math.maxInt(u64))) else 0;
+        self.syntax_scheduler.record(elapsed_ns);
+    }
+
+    fn deferSyntaxRefresh(self: *App, started_ns: i128) void {
+        const finished_ns = monotonicNowNs();
+        const elapsed_ns: u64 = if (finished_ns > started_ns) @intCast(@min(finished_ns - started_ns, std.math.maxInt(u64))) else syntax_budget_ns + 1;
+        self.syntax_scheduler.record(@max(elapsed_ns, syntax_budget_ns + 1));
+        self.syntax_highlights_back.clearRetainingCapacity();
+        self.syntax_refresh_after_ns = finished_ns + insert_syntax_idle_ns;
     }
 
     fn adjustSyntaxHighlightsForLastEdit(self: *App, previous_generation: u64) void {
@@ -1200,7 +1318,7 @@ test "undo timestamps format as clock plus relative age" {
     try std.testing.expectEqualStrings("3h ago", formatAge(&age_buf, 3 * 60 * 60));
 }
 
-test "syntax refresh waits for insert-mode idle" {
+test "syntax refresh is immediate until the budget is exceeded" {
     var buffer = try Buffer.initFromText(std.testing.allocator, "");
     defer buffer.deinit();
     var app: App = .{
@@ -1218,11 +1336,77 @@ test "syntax refresh waits for insert-mode idle" {
 
     app.setMode(.insert);
     try app.handleKey(.{ .char = 'a' });
+    try std.testing.expectEqual(@as(i128, 0), app.syntax_refresh_after_ns);
+    try std.testing.expect(app.syntaxRefreshDue(monotonicNowNs()));
+
+    app.syntax_generation = buffer.generation;
+    app.syntax_highlight_generation = buffer.generation;
+    app.syntax_scheduler.defer_until_idle = true;
+    try app.handleKey(.{ .char = 'b' });
+    try std.testing.expect(app.syntax_refresh_after_ns > 0);
     try std.testing.expect(!app.syntaxRefreshDue(app.syntax_refresh_after_ns - 1));
     try std.testing.expect(app.syntaxRefreshDue(app.syntax_refresh_after_ns));
+}
 
-    app.setMode(.normal);
-    try std.testing.expect(app.syntaxRefreshDue(monotonicNowNs()));
+test "syntax scheduler records percentiles and recovers" {
+    var scheduler: SyntaxScheduler = .{};
+    scheduler.record(syntax_budget_ns + 1);
+    try std.testing.expect(scheduler.defer_until_idle);
+    try std.testing.expectEqual(@as(u64, 1), scheduler.latency.over_budget);
+
+    scheduler.record(1_000);
+    scheduler.record(2_000);
+    try std.testing.expect(scheduler.defer_until_idle);
+    scheduler.record(3_000);
+    try std.testing.expect(!scheduler.defer_until_idle);
+    try std.testing.expectEqual(@as(usize, 4), scheduler.latency.count);
+    try std.testing.expect(scheduler.latency.averageNs() != 0);
+    try std.testing.expect(scheduler.latency.percentileNs(99) >= syntax_budget_ns);
+}
+
+test "syntax command reports latency counters" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+    };
+    defer app.deinit();
+    app.syntax_scheduler.record(1_000);
+    try app.command.appendSlice(std.testing.allocator, "syntax");
+
+    try app.executeCommand();
+
+    try std.testing.expect(std.mem.startsWith(u8, app.message.items, "syntax n=1"));
+    try std.testing.expect(std.mem.indexOf(u8, app.message.items, "p99=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.message.items, "mode=immediate") != null);
+}
+
+test "syntax highlight buffers swap atomically" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+    };
+    defer app.deinit();
+    try app.syntax_highlights.append(std.testing.allocator, .{ .start = 0, .end = 1, .kind = .keyword });
+    try app.syntax_highlights_back.append(std.testing.allocator, .{ .start = 2, .end = 3, .kind = .string });
+
+    app.swapSyntaxHighlights();
+
+    try std.testing.expectEqual(nivi.syntax.HighlightKind.string, app.syntax_highlights.items[0].kind);
+    try std.testing.expectEqual(nivi.syntax.HighlightKind.keyword, app.syntax_highlights_back.items[0].kind);
 }
 
 test "cached syntax spans follow insert edits" {

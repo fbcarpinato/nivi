@@ -11,6 +11,7 @@ pub const Error = error{
     MissingSymbol,
     InvalidState,
     InvalidQuery,
+    ParseCancelled,
 };
 
 pub const HighlightKind = enum {
@@ -154,9 +155,13 @@ pub const Highlighter = struct {
     }
 
     pub fn collectFull(self: *Highlighter, spans: *std.ArrayListUnmanaged(HighlightSpan), buffer: *const Buffer, visible: ?ByteRange) !void {
+        return self.collectFullBudgeted(spans, buffer, visible, null);
+    }
+
+    pub fn collectFullBudgeted(self: *Highlighter, spans: *std.ArrayListUnmanaged(HighlightSpan), buffer: *const Buffer, visible: ?ByteRange, budget_ns: ?u64) !void {
         const language = self.language orelse return;
         try self.parser.setLanguage(language);
-        const tree = try self.parser.parseBuffer(null, buffer);
+        const tree = try self.parser.parseBufferBudgeted(null, buffer, budget_ns);
         if (self.tree) |*old_tree| old_tree.deinit();
         self.tree = tree;
         self.tree_generation = buffer.generation;
@@ -165,16 +170,22 @@ pub const Highlighter = struct {
     }
 
     pub fn collectEdit(self: *Highlighter, spans: *std.ArrayListUnmanaged(HighlightSpan), buffer: *const Buffer, edit: TextEdit, visible: ?ByteRange) !void {
+        return self.collectEditBudgeted(spans, buffer, edit, visible, null);
+    }
+
+    pub fn collectEditBudgeted(self: *Highlighter, spans: *std.ArrayListUnmanaged(HighlightSpan), buffer: *const Buffer, edit: TextEdit, visible: ?ByteRange, budget_ns: ?u64) !void {
         const language = self.language orelse return;
         if (self.tree == null) return error.InvalidState;
         try self.parser.setLanguage(language);
 
         const input_edit = inputEditForTextEdit(edit);
-        self.tree.?.edit(input_edit);
+        var edited_tree = try self.tree.?.copy();
+        defer edited_tree.deinit();
+        edited_tree.edit(input_edit);
 
-        const tree = try self.parser.parseBuffer(&self.tree.?, buffer);
+        const tree = try self.parser.parseBufferBudgeted(&edited_tree, buffer, budget_ns);
         var range_count: u32 = 0;
-        const changed_ranges = c.ts_tree_get_changed_ranges(self.tree.?.ptr, tree.ptr, &range_count);
+        const changed_ranges = c.ts_tree_get_changed_ranges(edited_tree.ptr, tree.ptr, &range_count);
         defer if (changed_ranges != null) std.c.free(changed_ranges);
 
         if (changed_ranges != null and range_count != 0) {
@@ -253,6 +264,10 @@ pub const Parser = struct {
     }
 
     pub fn parseBuffer(self: Parser, old_tree: ?*const Tree, buffer: *const Buffer) Error!Tree {
+        return self.parseBufferBudgeted(old_tree, buffer, null);
+    }
+
+    pub fn parseBufferBudgeted(self: Parser, old_tree: ?*const Tree, buffer: *const Buffer, budget_ns: ?u64) Error!Tree {
         const old = if (old_tree) |tree| tree.ptr else null;
         const input: c.TSInput = .{
             .payload = @ptrCast(@constCast(buffer)),
@@ -260,10 +275,43 @@ pub const Parser = struct {
             .encoding = c.TSInputEncodingUTF8,
             .decode = null,
         };
-        const ptr = c.ts_parser_parse(self.ptr, old, input) orelse return error.OutOfMemory;
-        return .{ .ptr = ptr };
+        const ptr = if (budget_ns) |budget| blk: {
+            var deadline: ParseDeadline = .{ .deadline_ns = monotonicNowNs() + budget };
+            const options: c.TSParseOptions = .{
+                .payload = &deadline,
+                .progress_callback = parseProgress,
+            };
+            const result = c.ts_parser_parse_with_options(self.ptr, old, input, options);
+            if (result == null) {
+                c.ts_parser_reset(self.ptr);
+                if (deadline.cancelled) return error.ParseCancelled;
+                return error.OutOfMemory;
+            }
+            break :blk result;
+        } else c.ts_parser_parse(self.ptr, old, input);
+        const tree_ptr = ptr orelse return error.OutOfMemory;
+        return .{ .ptr = tree_ptr };
     }
 };
+
+const ParseDeadline = struct {
+    deadline_ns: u64,
+    cancelled: bool = false,
+};
+
+fn parseProgress(state: [*c]c.TSParseState) callconv(.c) bool {
+    if (state == null or state[0].payload == null) return false;
+    const deadline: *ParseDeadline = @ptrCast(@alignCast(state[0].payload.?));
+    if (monotonicNowNs() < deadline.deadline_ns) return false;
+    deadline.cancelled = true;
+    return true;
+}
+
+fn monotonicNowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
+}
 
 pub const Query = struct {
     ptr: *c.TSQuery,
@@ -429,6 +477,10 @@ pub const Tree = struct {
     pub fn deinit(self: *Tree) void {
         c.ts_tree_delete(self.ptr);
         self.* = undefined;
+    }
+
+    pub fn copy(self: Tree) Error!Tree {
+        return .{ .ptr = c.ts_tree_copy(self.ptr) orelse return error.OutOfMemory };
     }
 
     pub fn rootNode(self: Tree) Node {
@@ -774,6 +826,47 @@ test "zig indentation query computes structural depth" {
     try std.testing.expectEqual(@as(?usize, 4), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(3) + 4, 4));
     try std.testing.expectEqual(@as(?usize, 0), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(4), 4));
     try std.testing.expectEqual(@as(?usize, null), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(2), 4));
+}
+
+test "cancelled incremental parse preserves tree and spans for idle retry" {
+    var highlighter = try Highlighter.init(std.testing.io, std.testing.allocator, "test.zig");
+    defer highlighter.deinit();
+    if (!highlighter.enabled()) return;
+
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(std.testing.allocator);
+    try source.appendSlice(std.testing.allocator, "const marker = 0;\n");
+    for (0..5000) |index| {
+        var buf: [80]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "const value_{d} = {d};\n", .{ index, index });
+        try source.appendSlice(std.testing.allocator, line);
+    }
+
+    var buffer = try Buffer.initFromText(std.testing.allocator, source.items);
+    defer buffer.deinit();
+    var spans: std.ArrayListUnmanaged(HighlightSpan) = .empty;
+    defer spans.deinit(std.testing.allocator);
+    const visible: ByteRange = .{ .start = 0, .end = @min(buffer.byteLen(), 4096) };
+    try highlighter.collectFull(&spans, &buffer, visible);
+    const span_count = spans.items.len;
+    const tree_generation = highlighter.tree_generation;
+
+    try buffer.replace(6, 1, "n");
+    const edit = buffer.last_edit.?;
+    const text_edit: TextEdit = .{
+        .offset = edit.offset,
+        .old_end = edit.old_end,
+        .new_end = edit.new_end,
+        .start_point = .{ .row = edit.start_point.row, .column = edit.start_point.column },
+        .old_end_point = .{ .row = edit.old_end_point.row, .column = edit.old_end_point.column },
+        .new_end_point = .{ .row = edit.new_end_point.row, .column = edit.new_end_point.column },
+    };
+    try std.testing.expectError(error.ParseCancelled, highlighter.collectEditBudgeted(&spans, &buffer, text_edit, visible, 1));
+    try std.testing.expectEqual(span_count, spans.items.len);
+    try std.testing.expectEqual(tree_generation, highlighter.tree_generation);
+
+    try highlighter.collectEdit(&spans, &buffer, text_edit, visible);
+    try std.testing.expectEqual(buffer.generation, highlighter.tree_generation);
 }
 
 fn kindAt(spans: []const HighlightSpan, offset: usize) ?HighlightKind {

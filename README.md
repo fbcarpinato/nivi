@@ -280,8 +280,10 @@ Ordered roughly by expected impact. None of these are implemented yet.
 - [x] Replace Zig node-kind matching with Tree-sitter highlight queries (`queries/highlights.scm`).
 - [x] Map query captures (`@keyword`, `@string`, `@comment`, `@function`, `@type`, etc.) to renderer styles.
 - [x] Load parser/query paths from data-driven language configs instead of hardcoded Zig-specific logic.
+- [x] Double-buffer highlight snapshots and swap only complete query results into the renderer.
+- [x] Adaptive immediate parsing with a 2 ms Tree-sitter cancellation budget and idle retry.
 - [ ] Support a user/runtime grammar directory (for example `~/.local/share/nivi/parsers/*.so`).
-- [ ] Keep syntax work off the input/render critical path via a worker or cooperative time budget.
+- [ ] Optional background syntax worker once the rope supports immutable read snapshots.
 
 Long-term shape: `Buffer` emits text edits, `DocumentSyntax` consumes edits and owns the
 Tree-sitter tree while reading directly from rope leaves, a `LanguageRegistry` resolves
@@ -309,6 +311,7 @@ highlight spans.
 - [ ] Add CSV/JSON benchmark output + regression baseline tracking.
 - [ ] Real-file workload benchmarks (source trees, logs, minified JS).
 - [ ] Latency percentiles (p50/p99) in addition to best-of-N.
+- [x] Incremental syntax latency benchmark (`zig build bench-syntax`) with average/p50/p99/max and budget cancellation.
 
 ## Status
 
