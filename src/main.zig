@@ -34,6 +34,7 @@ const App = struct {
     command: std.ArrayListUnmanaged(u8) = .empty,
     message: std.ArrayListUnmanaged(u8) = .empty,
     render_scratch: std.ArrayListUnmanaged(u8) = .empty,
+    indent_scratch: std.ArrayListUnmanaged(u8) = .empty,
     syntax_highlights: std.ArrayListUnmanaged(nivi.syntax.HighlightSpan) = .empty,
     syntax_generation: u64 = 0,
     syntax_highlight_generation: u64 = 0,
@@ -56,6 +57,7 @@ const App = struct {
         self.command.deinit(self.allocator);
         self.message.deinit(self.allocator);
         self.render_scratch.deinit(self.allocator);
+        self.indent_scratch.deinit(self.allocator);
         self.syntax_highlights.deinit(self.allocator);
         self.undo_rows.deinit(self.allocator);
     }
@@ -86,7 +88,16 @@ const App = struct {
         if (self.buffer.generation != before_generation) {
             const delay = if (self.mode == .insert) insert_syntax_idle_ns else syntax_debounce_ns;
             self.syntax_refresh_after_ns = monotonicNowNs() + delay;
-            self.adjustSyntaxHighlightsForLastEdit(before_generation);
+            if (self.buffer.generation == before_generation + 1) {
+                self.adjustSyntaxHighlightsForLastEdit(before_generation);
+            } else {
+                self.syntax_highlights.clearRetainingCapacity();
+                self.syntax_highlight_generation = self.buffer.generation;
+                // Multi-edit commands cannot be remapped from only `last_edit`.
+                // Rebuild before the next frame instead of briefly drawing an
+                // unhighlighted viewport during the insert-mode debounce.
+                self.syntax_refresh_after_ns = 0;
+            }
         }
         self.needs_render = true;
         try self.keepCursorVisible();
@@ -173,6 +184,8 @@ const App = struct {
                     self.vim.cancel();
                     if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
                 },
+                'o' => try self.openIndentedLine(key, true),
+                'O' => try self.openIndentedLine(key, false),
                 else => try self.handleVimNormal(key),
             },
             .ctrl => |ch| if (ch == 'r') {
@@ -324,7 +337,9 @@ const App = struct {
             .escape => self.setMode(.normal),
             .enter => {
                 self.ensureInsertGroup();
-                try self.cursor.insertText(self.buffer, "\n");
+                const columns = try self.desiredIndent(self.cursor.offset, true);
+                const text = try self.newlineWithIndent(columns);
+                try self.cursor.insertText(self.buffer, text);
             },
             .backspace => {
                 self.ensureInsertGroup();
@@ -351,13 +366,105 @@ const App = struct {
                 try self.cursor.moveDown(self.buffer.*);
             },
             .char => |ch| {
+                const token_start = self.cursor.offset;
+                const line_prefix_is_whitespace = self.cursorPrefixIsWhitespace();
                 var bytes: [4]u8 = undefined;
                 const len = try std.unicode.utf8Encode(ch, &bytes);
                 self.ensureInsertGroup();
                 try self.cursor.insertText(self.buffer, bytes[0..len]);
+                if (line_prefix_is_whitespace) try self.reindentIfIndentEnd(token_start, len);
             },
             else => {},
         }
+    }
+
+    fn cursorPrefixIsWhitespace(self: App) bool {
+        const line = self.buffer.lineAt(self.cursor.offset);
+        const line_start = self.buffer.byteOffsetForLine(line);
+        var offset = line_start;
+        while (offset < self.cursor.offset) : (offset += 1) {
+            const byte = self.buffer.byteAt(offset);
+            if (byte != ' ' and byte != '\t') return false;
+        }
+        return true;
+    }
+
+    fn reindentIfIndentEnd(self: *App, token_start: usize, token_len: usize) !void {
+        const columns = (try self.syntax.indentEndColumns(self.buffer, token_start, self.buffer.tab_width)) orelse return;
+        const line = self.buffer.lineAt(token_start);
+        const line_start = self.buffer.byteOffsetForLine(line);
+        const old_indent_len = token_start - line_start;
+        if (old_indent_len == columns) {
+            var all_spaces = true;
+            var offset = line_start;
+            while (offset < token_start) : (offset += 1) {
+                if (self.buffer.byteAt(offset) != ' ') {
+                    all_spaces = false;
+                    break;
+                }
+            }
+            if (all_spaces) return;
+        }
+
+        const indent = try self.indentText(columns);
+        try self.buffer.replace(line_start, old_indent_len, indent);
+        try self.cursor.setOffset(self.buffer.*, line_start + columns + token_len);
+    }
+
+    fn openIndentedLine(self: *App, key: Key, below: bool) !void {
+        try self.cursor.sync(self.buffer.*);
+        const line = self.buffer.lineAt(self.cursor.offset);
+        const context_offset = if (below) self.buffer.lineContentRange(line).end else self.buffer.byteOffsetForLine(line);
+        const columns = try self.desiredIndent(context_offset, below);
+        self.ensureInsertGroup();
+        try self.handleVimNormal(key);
+        if (columns != 0) {
+            const indent = try self.indentText(columns);
+            try self.cursor.insertText(self.buffer, indent);
+        }
+    }
+
+    fn desiredIndent(self: *App, offset: usize, after_line: bool) !usize {
+        if (try self.syntax.indentColumns(self.buffer, offset, self.buffer.tab_width)) |columns| return columns;
+        return self.fallbackIndent(offset, after_line);
+    }
+
+    fn fallbackIndent(self: App, offset: usize, after_line: bool) usize {
+        var line = self.buffer.lineAt(@min(offset, self.buffer.byteLen()));
+        var range = self.buffer.lineContentRange(line);
+        while (range.start == range.end and line > 0) {
+            line -= 1;
+            range = self.buffer.lineContentRange(line);
+        }
+        var columns: usize = 0;
+        var at = range.start;
+        while (at < range.end) : (at += 1) switch (self.buffer.byteAt(at)) {
+            ' ' => columns += 1,
+            '\t' => columns += self.buffer.tab_width - (columns % self.buffer.tab_width),
+            else => break,
+        };
+        if (after_line and range.end > range.start) {
+            var end = range.end;
+            while (end > range.start and (self.buffer.byteAt(end - 1) == ' ' or self.buffer.byteAt(end - 1) == '\t')) : (end -= 1) {}
+            if (end > range.start) switch (self.buffer.byteAt(end - 1)) {
+                '{', '[', '(' => columns += self.buffer.tab_width,
+                else => {},
+            };
+        }
+        return columns;
+    }
+
+    fn newlineWithIndent(self: *App, columns: usize) ![]const u8 {
+        self.indent_scratch.clearRetainingCapacity();
+        try self.indent_scratch.append(self.allocator, '\n');
+        try self.indent_scratch.appendNTimes(self.allocator, ' ', columns);
+        return self.indent_scratch.items;
+    }
+
+    fn indentText(self: *App, columns: usize) ![]const u8 {
+        self.indent_scratch.clearRetainingCapacity();
+        try self.indent_scratch.appendNTimes(self.allocator, ' ', columns);
+        return self.indent_scratch.items;
     }
 
     fn handleCommand(self: *App, key: Key) !void {
@@ -1170,4 +1277,98 @@ test "cached syntax drops edited span and shifts later spans" {
     try std.testing.expectEqual(@as(usize, 1), app.syntax_highlights.items.len);
     try std.testing.expectEqual(@as(usize, 7), app.syntax_highlights.items[0].start);
     try std.testing.expectEqual(@as(usize, 8), app.syntax_highlights.items[0].end);
+}
+
+test "query indentation applies to open-line and enter" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "fn main() void {\n}\n");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, "test.zig"),
+    };
+    defer app.deinit();
+    if (!app.syntax.enabled()) return;
+
+    try app.handleKey(.{ .char = 'o' });
+    try app.handleKey(.{ .char = 'x' });
+    try app.handleKey(.enter);
+    try app.handleKey(.escape);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("fn main() void {\n    x\n    \n}\n", text);
+}
+
+test "query indentation applies to open-line above" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "fn main() void {\n}\n");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, buffer.byteOffsetForLine(1)),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, "test.zig"),
+    };
+    defer app.deinit();
+    if (!app.syntax.enabled()) return;
+
+    try app.handleKey(.{ .char = 'O' });
+    try app.handleKey(.escape);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("fn main() void {\n    \n}\n", text);
+}
+
+test "closing delimiter reindents incomplete syntax" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "fn main() void {\n        ");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, buffer.byteLen()),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, "test.zig"),
+        .mode = .insert,
+    };
+    defer app.deinit();
+    if (!app.syntax.enabled()) return;
+
+    try app.handleKey(.{ .char = '}' });
+    try std.testing.expectEqual(@as(i128, 0), app.syntax_refresh_after_ns);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("fn main() void {\n}", text);
+}
+
+test "indentation falls back without a grammar" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "if condition {\n");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, buffer.byteLen()),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .mode = .insert,
+    };
+    defer app.deinit();
+
+    try app.handleKey(.enter);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("if condition {\n\n    ", text);
 }

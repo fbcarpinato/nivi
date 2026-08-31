@@ -275,17 +275,28 @@ Ordered roughly by expected impact. None of these are implemented yet.
 
 ### Syntax architecture
 - [x] Tree-sitter runtime wrapper for parser/tree/node ownership.
-- [x] Zig proof-of-concept: dynamic grammar loading, incremental edits, viewport-scoped highlight spans.
+- [x] Rope-backed `TSInput`, incremental edits, changed-range updates, and viewport-scoped spans.
 - [ ] Split syntax into language-agnostic runtime + language registry + document syntax state.
-- [ ] Replace Zig node-kind matching with Tree-sitter highlight queries (`queries/highlights.scm`).
-- [ ] Map query captures (`@keyword`, `@string`, `@comment`, `@function`, `@type`, etc.) to renderer styles.
-- [ ] Load parser/query paths from data-driven language configs instead of hardcoded Zig-specific logic.
+- [x] Replace Zig node-kind matching with Tree-sitter highlight queries (`queries/highlights.scm`).
+- [x] Map query captures (`@keyword`, `@string`, `@comment`, `@function`, `@type`, etc.) to renderer styles.
+- [x] Load parser/query paths from data-driven language configs instead of hardcoded Zig-specific logic.
 - [ ] Support a user/runtime grammar directory (for example `~/.local/share/nivi/parsers/*.so`).
 - [ ] Keep syntax work off the input/render critical path via a worker or cooperative time budget.
 
 Long-term shape: `Buffer` emits text edits, `DocumentSyntax` consumes edits and owns the
-Tree-sitter tree/source mirror, a `LanguageRegistry` resolves filetypes to parser + query
-config, and the renderer only consumes language-independent highlight spans.
+Tree-sitter tree while reading directly from rope leaves, a `LanguageRegistry` resolves
+filetypes to parser + query config, and the renderer only consumes language-independent
+highlight spans.
+
+### Indentation architecture
+- [x] Query-first indentation provider using `queries/<language>/indents.scm`.
+- [x] Nivi capture contract for `@indent.begin` and `@indent.end`.
+- [x] Syntax-aware indentation for insert-mode Enter and normal-mode `o` / `O`.
+- [x] Query-driven closing-token reindent with atomic syntax refresh before rendering.
+- [x] Conservative previous-line and delimiter fallback when no grammar/query is available.
+- [ ] Add `@indent.align`, `@indent.branch`, and `@indent.ignore` semantics.
+- [ ] Preserve configurable tabs/spaces policy instead of always emitting spaces.
+- [ ] Cache line indentation by syntax generation and invalidate from changed ranges.
 
 ### Robustness / production
 - [ ] Fuzz tests (`std.testing.fuzz`) for edits and Unicode boundaries.

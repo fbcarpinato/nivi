@@ -70,6 +70,7 @@ pub const LanguageConfig = struct {
     extensions: []const []const u8,
     parser_env: [:0]const u8,
     highlights_env: [:0]const u8,
+    indents_env: [:0]const u8,
     parser_symbol: [:0]const u8,
 };
 
@@ -79,6 +80,7 @@ const language_configs = [_]LanguageConfig{.{
     .extensions = &zig_extensions,
     .parser_env = "TREE_SITTER_ZIG_PARSER",
     .highlights_env = "TREE_SITTER_ZIG_HIGHLIGHTS",
+    .indents_env = "TREE_SITTER_ZIG_INDENTS",
     .parser_symbol = "tree_sitter_zig",
 }};
 
@@ -88,8 +90,10 @@ pub const Highlighter = struct {
     library: ?std.DynLib = null,
     language: ?Language = null,
     query: ?Query = null,
+    indent_query: ?Query = null,
     query_cursor: ?QueryCursor = null,
     tree: ?Tree = null,
+    tree_generation: u64 = 0,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8) !Highlighter {
         var highlighter: Highlighter = .{
@@ -106,6 +110,7 @@ pub const Highlighter = struct {
     pub fn deinit(self: *Highlighter) void {
         if (self.tree) |*tree| tree.deinit();
         if (self.query_cursor) |*cursor| cursor.deinit();
+        if (self.indent_query) |*query| query.deinit();
         if (self.query) |*query| query.deinit();
         if (self.library) |*lib| lib.close();
         self.parser.deinit();
@@ -116,12 +121,45 @@ pub const Highlighter = struct {
         return self.language != null;
     }
 
+    pub fn indentColumns(self: *Highlighter, buffer: *const Buffer, offset: usize, indent_width: usize) !?usize {
+        const language = self.language orelse return null;
+        const query = self.indent_query orelse return null;
+        if (self.query_cursor == null) return null;
+        try self.parser.setLanguage(language);
+
+        var temporary_tree: ?Tree = null;
+        defer if (temporary_tree) |*tree| tree.deinit();
+        const root = if (self.tree != null and self.tree_generation == buffer.generation)
+            self.tree.?.rootNode()
+        else blk: {
+            temporary_tree = try self.parser.parseBuffer(null, buffer);
+            break :blk temporary_tree.?.rootNode();
+        };
+
+        const info = self.query_cursor.?.indentInfo(&query, root, @min(offset, buffer.byteLen()));
+        return info.level * indent_width;
+    }
+
+    pub fn indentEndColumns(self: *Highlighter, buffer: *const Buffer, offset: usize, indent_width: usize) !?usize {
+        const language = self.language orelse return null;
+        const query = self.indent_query orelse return null;
+        if (self.query_cursor == null) return null;
+        try self.parser.setLanguage(language);
+
+        var temporary_tree = try self.parser.parseBuffer(null, buffer);
+        defer temporary_tree.deinit();
+        const info = self.query_cursor.?.indentInfo(&query, temporary_tree.rootNode(), @min(offset, buffer.byteLen()));
+        if (!info.is_end) return null;
+        return (info.level -| 1) * indent_width;
+    }
+
     pub fn collectFull(self: *Highlighter, spans: *std.ArrayListUnmanaged(HighlightSpan), buffer: *const Buffer, visible: ?ByteRange) !void {
         const language = self.language orelse return;
         try self.parser.setLanguage(language);
         const tree = try self.parser.parseBuffer(null, buffer);
         if (self.tree) |*old_tree| old_tree.deinit();
         self.tree = tree;
+        self.tree_generation = buffer.generation;
 
         try self.collectQuery(spans, buffer, self.tree.?.rootNode(), visible);
     }
@@ -154,6 +192,7 @@ pub const Highlighter = struct {
 
         self.tree.?.deinit();
         self.tree = tree;
+        self.tree_generation = buffer.generation;
         try normalizeSpans(spans, self.allocator);
     }
 
@@ -177,8 +216,12 @@ pub const Highlighter = struct {
         const query_path = std.c.getenv(config.highlights_env) orelse return;
         const query_source = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(query_path), self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(query_source);
+        const indent_path = std.c.getenv(config.indents_env) orelse return;
+        const indent_source = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(indent_path), self.allocator, .limited(1024 * 1024));
+        defer self.allocator.free(indent_source);
 
         self.query = try Query.init(language, query_source);
+        self.indent_query = try Query.init(language, indent_source);
         self.query_cursor = try QueryCursor.init();
         self.language = language;
         self.library = lib;
@@ -315,6 +358,53 @@ pub const QueryCursor = struct {
                 });
             }
         }
+    }
+
+    const IndentInfo = struct {
+        level: usize,
+        is_end: bool,
+    };
+
+    fn indentInfo(self: QueryCursor, query: *const Query, root: Node, offset: usize) IndentInfo {
+        const tree_end = root.endByte();
+        if (tree_end == 0) return .{ .level = 0, .is_end = false };
+        const probe = @min(offset, tree_end - 1);
+        _ = c.ts_query_cursor_set_byte_range(self.ptr, @intCast(probe), @intCast(probe + 1));
+        c.ts_query_cursor_exec(self.ptr, query.ptr, root.raw);
+
+        const Range = struct { start: usize, end: usize };
+        var seen: [128]Range = undefined;
+        var seen_len: usize = 0;
+        var is_end = false;
+        var match: c.TSQueryMatch = undefined;
+        while (c.ts_query_cursor_next_match(self.ptr, &match)) {
+            var index: usize = 0;
+            while (index < match.capture_count) : (index += 1) {
+                const capture = match.captures[index];
+                const node: Node = .{ .raw = capture.node };
+                const capture_name = query.captureName(capture.index);
+                if (std.mem.eql(u8, capture_name, "indent.end")) {
+                    if (node.startByte() == offset) is_end = true;
+                    continue;
+                }
+                if (!std.mem.eql(u8, capture_name, "indent.begin")) continue;
+                const start = node.startByte();
+                const end = node.endByte();
+                if (start >= offset or end < offset) continue;
+                var duplicate = false;
+                for (seen[0..seen_len]) |range| {
+                    if (range.start == start and range.end == end) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate and seen_len < seen.len) {
+                    seen[seen_len] = .{ .start = start, .end = end };
+                    seen_len += 1;
+                }
+            }
+        }
+        return .{ .level = seen_len, .is_end = is_end };
     }
 };
 
@@ -663,6 +753,27 @@ test "zig highlight query applies semantic captures and predicates" {
     try std.testing.expectEqual(HighlightKind.character, kindAt(spans.items, std.mem.indexOf(u8, source, "'x'").?));
     try std.testing.expectEqual(HighlightKind.module, kindAt(spans.items, std.mem.indexOf(u8, source, "std =").?));
     try std.testing.expectEqual(HighlightKind.keyword, kindAt(spans.items, std.mem.indexOf(u8, source, "@import").?));
+}
+
+test "zig indentation query computes structural depth" {
+    var highlighter = try Highlighter.init(std.testing.io, std.testing.allocator, "test.zig");
+    defer highlighter.deinit();
+    if (!highlighter.enabled()) return;
+    var buffer = try Buffer.initFromText(std.testing.allocator,
+        \\fn main() void {
+        \\    const value = .{
+        \\        .field = 1,
+        \\    };
+        \\}
+    );
+    defer buffer.deinit();
+
+    try std.testing.expectEqual(@as(?usize, 4), try highlighter.indentColumns(&buffer, buffer.byteOffsetForLine(1), 4));
+    try std.testing.expectEqual(@as(?usize, 8), try highlighter.indentColumns(&buffer, buffer.byteOffsetForLine(2), 4));
+    try std.testing.expectEqual(@as(?usize, 0), try highlighter.indentColumns(&buffer, 0, 4));
+    try std.testing.expectEqual(@as(?usize, 4), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(3) + 4, 4));
+    try std.testing.expectEqual(@as(?usize, 0), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(4), 4));
+    try std.testing.expectEqual(@as(?usize, null), try highlighter.indentEndColumns(&buffer, buffer.byteOffsetForLine(2), 4));
 }
 
 fn kindAt(spans: []const HighlightSpan, offset: usize) ?HighlightKind {

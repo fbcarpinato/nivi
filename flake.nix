@@ -38,6 +38,7 @@
             export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/local"
             export TREE_SITTER_ZIG_PARSER="${pkgs.tree-sitter-grammars.tree-sitter-zig}/parser"
             export TREE_SITTER_ZIG_HIGHLIGHTS="${pkgs.tree-sitter-grammars.tree-sitter-zig}/queries/highlights.scm"
+            export TREE_SITTER_ZIG_INDENTS="$PWD/queries/zig/indents.scm"
             echo "nivi dev shell: zig $(zig version)"
           '';
         };
