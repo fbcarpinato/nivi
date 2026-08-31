@@ -9,8 +9,13 @@ const Key = nivi.input.Key;
 const Rect = nivi.render.Rect;
 
 const Mode = enum { normal, insert, command, visual, visual_line };
-const syntax_debounce_ns = 25 * std.time.ns_per_ms;
+const Focus = enum { editor, undo_tree };
+const LeaderState = enum { none, leader, leader_u };
+const UndoDirection = enum { up, down };
+const syntax_debounce_ns: i128 = 25 * std.time.ns_per_ms;
+const insert_syntax_idle_ns: i128 = 100 * std.time.ns_per_ms;
 const frame_timeout_ms = 16;
+const undo_panel_width = 32;
 
 const App = struct {
     allocator: std.mem.Allocator,
@@ -29,22 +34,30 @@ const App = struct {
     command: std.ArrayListUnmanaged(u8) = .empty,
     message: std.ArrayListUnmanaged(u8) = .empty,
     render_scratch: std.ArrayListUnmanaged(u8) = .empty,
-    syntax_source: std.ArrayListUnmanaged(u8) = .empty,
     syntax_highlights: std.ArrayListUnmanaged(nivi.syntax.HighlightSpan) = .empty,
     syntax_generation: u64 = 0,
+    syntax_highlight_generation: u64 = 0,
     syntax_visible: nivi.syntax.ByteRange = .{ .start = 0, .end = 0 },
     syntax_refresh_after_ns: i128 = 0,
     needs_render: bool = true,
+    focus: Focus = .editor,
+    leader: LeaderState = .none,
+    undo_panel_open: bool = false,
+    undo_rows: std.ArrayListUnmanaged(*nivi.UndoNode) = .empty,
+    undo_selected: usize = 0,
+    undo_first_row: usize = 0,
+    insert_group_open: bool = false,
     should_quit: bool = false,
 
     fn deinit(self: *App) void {
+        self.closeInsertGroup();
         self.syntax.deinit();
         self.vim.deinit();
         self.command.deinit(self.allocator);
         self.message.deinit(self.allocator);
         self.render_scratch.deinit(self.allocator);
-        self.syntax_source.deinit(self.allocator);
         self.syntax_highlights.deinit(self.allocator);
+        self.undo_rows.deinit(self.allocator);
     }
 
     fn setMessage(self: *App, comptime fmt: []const u8, args: anytype) !void {
@@ -56,17 +69,95 @@ const App = struct {
 
     fn handleKey(self: *App, key: Key) !void {
         const before_generation = self.buffer.generation;
-        switch (self.mode) {
-            .normal => try self.handleNormal(key),
-            .insert => try self.handleInsert(key),
-            .command => try self.handleCommand(key),
-            .visual, .visual_line => try self.handleVisual(key),
+        if (self.mode == .normal and self.globalNormalCommand(key)) {
+            // handled global normal-mode command
+        } else if (self.mode == .normal and try self.handleLeader(key)) {
+            // handled leader key sequence
+        } else if (self.focus == .undo_tree and self.mode == .normal) {
+            try self.handleUndoTreePanel(key);
+        } else {
+            switch (self.mode) {
+                .normal => try self.handleNormal(key),
+                .insert => try self.handleInsert(key),
+                .command => try self.handleCommand(key),
+                .visual, .visual_line => try self.handleVisual(key),
+            }
         }
         if (self.buffer.generation != before_generation) {
-            self.syntax_refresh_after_ns = monotonicNowNs() + syntax_debounce_ns;
+            const delay = if (self.mode == .insert) insert_syntax_idle_ns else syntax_debounce_ns;
+            self.syntax_refresh_after_ns = monotonicNowNs() + delay;
+            self.adjustSyntaxHighlightsForLastEdit(before_generation);
         }
         self.needs_render = true;
         try self.keepCursorVisible();
+    }
+
+    fn globalNormalCommand(self: *App, key: Key) bool {
+        switch (key) {
+            .char => |ch| if (ch == ':') {
+                self.vim.cancel();
+                self.command.clearRetainingCapacity();
+                self.setMode(.command);
+                return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn setMode(self: *App, mode: Mode) void {
+        if (self.mode == .insert and mode != .insert) {
+            self.closeInsertGroup();
+            if (self.syntax_generation != self.buffer.generation) self.syntax_refresh_after_ns = 0;
+        }
+        self.mode = mode;
+    }
+
+    fn ensureInsertGroup(self: *App) void {
+        if (self.insert_group_open) return;
+        self.buffer.beginUndoGroup(self.cursor.offset);
+        self.insert_group_open = true;
+    }
+
+    fn closeInsertGroup(self: *App) void {
+        if (!self.insert_group_open) return;
+        self.buffer.endUndoGroup(self.cursor.offset);
+        self.insert_group_open = false;
+    }
+
+    fn handleLeader(self: *App, key: Key) !bool {
+        switch (self.leader) {
+            .none => switch (key) {
+                .char => |ch| if (ch == ',') {
+                    self.leader = .leader;
+                    self.vim.cancel();
+                    return true;
+                },
+                else => {},
+            },
+            .leader => switch (key) {
+                .char => |ch| {
+                    self.leader = if (ch == 'u') .leader_u else .none;
+                    return true;
+                },
+                else => {
+                    self.leader = .none;
+                    return true;
+                },
+            },
+            .leader_u => switch (key) {
+                .char => |ch| {
+                    self.leader = .none;
+                    if (ch == 't') try self.toggleUndoTreePanel();
+                    return true;
+                },
+                else => {
+                    self.leader = .none;
+                    return true;
+                },
+            },
+        }
+        return false;
     }
 
     fn refreshCursorMetrics(self: *App) !void {
@@ -77,11 +168,7 @@ const App = struct {
     fn handleNormal(self: *App, key: Key) !void {
         switch (key) {
             .char => |ch| switch (ch) {
-                ':' => {
-                    self.vim.cancel();
-                    self.command.clearRetainingCapacity();
-                    self.mode = .command;
-                },
+                ':' => {},
                 'u' => {
                     self.vim.cancel();
                     if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
@@ -91,11 +178,109 @@ const App = struct {
             .ctrl => |ch| if (ch == 'r') {
                 self.vim.cancel();
                 if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
+            } else if (ch == 'l' and self.undo_panel_open) {
+                self.vim.cancel();
+                self.focus = .undo_tree;
+                try self.rebuildUndoRows();
+            } else if (ch == 'h') {
+                self.vim.cancel();
+                self.focus = .editor;
             } else try self.handleVimNormal(key),
             .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => try self.handleVimNormal(key),
             .unknown => |bytes| try self.setUnknownKeyMessage(bytes),
             else => {},
         }
+    }
+
+    fn handleUndoTreePanel(self: *App, key: Key) !void {
+        switch (key) {
+            .escape => self.focus = .editor,
+            .enter => try self.jumpToSelectedUndoState(),
+            .arrow_up => self.moveUndoSelection(.up),
+            .arrow_down => self.moveUndoSelection(.down),
+            .ctrl => |ch| switch (ch) {
+                'h' => self.focus = .editor,
+                'l' => self.focus = .undo_tree,
+                'j' => self.moveUndoSelection(.down),
+                'k' => self.moveUndoSelection(.up),
+                else => {},
+            },
+            .char => |ch| switch (ch) {
+                'h' => self.focus = .editor,
+                'j' => self.moveUndoSelection(.down),
+                'k' => self.moveUndoSelection(.up),
+                'l' => {},
+                'o' => try self.jumpToSelectedUndoState(),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    fn toggleUndoTreePanel(self: *App) !void {
+        self.undo_panel_open = !self.undo_panel_open;
+        if (self.undo_panel_open) {
+            self.focus = .undo_tree;
+            try self.rebuildUndoRows();
+            try self.selectCurrentUndoState();
+        } else {
+            self.focus = .editor;
+        }
+    }
+
+    fn rebuildUndoRows(self: *App) !void {
+        self.buffer.undo_tree.commitOpen();
+        self.undo_rows.clearRetainingCapacity();
+        try self.appendUndoRows(self.buffer.undo_tree.root);
+        if (self.undo_rows.items.len == 0) {
+            self.undo_selected = 0;
+            self.undo_first_row = 0;
+        } else if (self.undo_selected >= self.undo_rows.items.len) {
+            self.undo_selected = self.undo_rows.items.len - 1;
+        }
+    }
+
+    fn appendUndoRows(self: *App, node: *nivi.UndoNode) !void {
+        try self.undo_rows.append(self.allocator, node);
+        for (node.children.items) |child| try self.appendUndoRows(child);
+    }
+
+    fn selectCurrentUndoState(self: *App) !void {
+        try self.rebuildUndoRows();
+        for (self.undo_rows.items, 0..) |node, index| {
+            if (node == self.buffer.undo_tree.current) {
+                self.undo_selected = index;
+                self.keepUndoSelectionVisible();
+                return;
+            }
+        }
+    }
+
+    fn moveUndoSelection(self: *App, direction: UndoDirection) void {
+        if (self.undo_rows.items.len == 0) return;
+        switch (direction) {
+            .up => {
+                if (self.undo_selected > 0) self.undo_selected -= 1;
+            },
+            .down => {
+                if (self.undo_selected + 1 < self.undo_rows.items.len) self.undo_selected += 1;
+            },
+        }
+        self.keepUndoSelectionVisible();
+    }
+
+    fn keepUndoSelectionVisible(self: *App) void {
+        const height = self.editor_area.height;
+        if (height == 0) return;
+        if (self.undo_selected < self.undo_first_row) self.undo_first_row = self.undo_selected;
+        if (self.undo_selected >= self.undo_first_row + height) self.undo_first_row = self.undo_selected - height + 1;
+    }
+
+    fn jumpToSelectedUndoState(self: *App) !void {
+        if (self.undo_selected >= self.undo_rows.items.len) return;
+        const node = self.undo_rows.items[self.undo_selected];
+        if (try self.buffer.jumpToState(node.seq)) |offset| try self.cursor.setOffset(self.buffer.*, offset);
+        try self.selectCurrentUndoState();
     }
 
     fn setUnknownKeyMessage(self: *App, bytes: []const u8) !void {
@@ -111,42 +296,64 @@ const App = struct {
     fn handleVimNormal(self: *App, key: Key) !void {
         switch (try self.vim.handleNormal(self.buffer, &self.cursor, key)) {
             .none => {},
-            .enter_insert => self.mode = .insert,
+            .enter_insert => self.setMode(.insert),
             .enter_visual => try self.enterVisual(.visual),
             .enter_visual_line => try self.enterVisual(.visual_line),
-            .exit_visual => self.mode = .normal,
+            .exit_visual => self.setMode(.normal),
         }
     }
 
     fn enterVisual(self: *App, mode: Mode) !void {
         try self.cursor.sync(self.buffer.*);
         self.selection = Selection.fromCursor(self.cursor);
-        self.mode = mode;
+        self.setMode(mode);
     }
 
     fn handleVisual(self: *App, key: Key) !void {
         switch (try self.vim.handleVisual(self.buffer, &self.cursor, &self.selection, self.mode == .visual_line, key)) {
             .none => {},
-            .enter_insert => self.mode = .insert,
+            .enter_insert => self.setMode(.insert),
             .enter_visual => try self.enterVisual(.visual),
-            .enter_visual_line => self.mode = .visual_line,
-            .exit_visual => self.mode = .normal,
+            .enter_visual_line => self.setMode(.visual_line),
+            .exit_visual => self.setMode(.normal),
         }
     }
 
     fn handleInsert(self: *App, key: Key) !void {
         switch (key) {
-            .escape => self.mode = .normal,
-            .enter => try self.cursor.insertText(self.buffer, "\n"),
-            .backspace => try self.cursor.deleteBackward(self.buffer),
-            .delete => try self.cursor.deleteForward(self.buffer),
-            .arrow_left => try self.cursor.moveLeft(self.buffer.*),
-            .arrow_right => try self.cursor.moveRight(self.buffer.*),
-            .arrow_up => try self.cursor.moveUp(self.buffer.*),
-            .arrow_down => try self.cursor.moveDown(self.buffer.*),
+            .escape => self.setMode(.normal),
+            .enter => {
+                self.ensureInsertGroup();
+                try self.cursor.insertText(self.buffer, "\n");
+            },
+            .backspace => {
+                self.ensureInsertGroup();
+                try self.cursor.deleteBackward(self.buffer);
+            },
+            .delete => {
+                self.ensureInsertGroup();
+                try self.cursor.deleteForward(self.buffer);
+            },
+            .arrow_left => {
+                self.closeInsertGroup();
+                try self.cursor.moveLeft(self.buffer.*);
+            },
+            .arrow_right => {
+                self.closeInsertGroup();
+                try self.cursor.moveRight(self.buffer.*);
+            },
+            .arrow_up => {
+                self.closeInsertGroup();
+                try self.cursor.moveUp(self.buffer.*);
+            },
+            .arrow_down => {
+                self.closeInsertGroup();
+                try self.cursor.moveDown(self.buffer.*);
+            },
             .char => |ch| {
                 var bytes: [4]u8 = undefined;
                 const len = try std.unicode.utf8Encode(ch, &bytes);
+                self.ensureInsertGroup();
                 try self.cursor.insertText(self.buffer, bytes[0..len]);
             },
             else => {},
@@ -155,7 +362,7 @@ const App = struct {
 
     fn handleCommand(self: *App, key: Key) !void {
         switch (key) {
-            .escape => self.mode = .normal,
+            .escape => self.setMode(.normal),
             .backspace => {
                 if (self.command.items.len != 0) _ = self.command.pop();
             },
@@ -170,7 +377,7 @@ const App = struct {
     fn executeCommand(self: *App) !void {
         const cmd = std.mem.trim(u8, self.command.items, " \t");
         defer self.command.clearRetainingCapacity();
-        self.mode = .normal;
+        self.setMode(.normal);
 
         if (std.mem.eql(u8, cmd, "w")) {
             try self.buffer.save(self.io);
@@ -224,36 +431,68 @@ const App = struct {
     fn renderHighlights(self: *App, visible: nivi.syntax.ByteRange, now_ns: i128) !?[]const nivi.syntax.HighlightSpan {
         if (!self.syntax.enabled()) return null;
         if (self.syntax_generation == self.buffer.generation) {
-            if (std.meta.eql(self.syntax_visible, visible)) return self.syntax_highlights.items;
+            if (self.syntax_highlight_generation == self.buffer.generation and std.meta.eql(self.syntax_visible, visible)) return self.syntax_highlights.items;
             self.syntax_highlights.clearRetainingCapacity();
-            try self.syntax.collectVisible(&self.syntax_highlights, visible);
+            try self.syntax.collectVisible(&self.syntax_highlights, self.buffer, visible);
+            self.syntax_highlight_generation = self.buffer.generation;
             self.syntax_visible = visible;
             return self.syntax_highlights.items;
         }
+        if (self.mode == .insert and self.syntax_highlight_generation == self.buffer.generation and now_ns < self.syntax_refresh_after_ns) return self.syntax_highlights.items;
         if (self.syntax_generation != 0 and now_ns < self.syntax_refresh_after_ns) return self.syntax_highlights.items;
 
-        self.syntax_highlights.clearRetainingCapacity();
         if (self.syntax_generation != 0 and self.syntax_generation + 1 == self.buffer.generation and self.buffer.last_edit != null and self.buffer.last_edit.?.generation == self.buffer.generation) {
             const edit = self.buffer.last_edit.?;
-            const inserted_len = edit.new_end - edit.offset;
-            self.syntax_source.clearRetainingCapacity();
-            try self.syntax_source.resize(self.allocator, inserted_len);
-            if (inserted_len != 0) self.buffer.copyRange(self.syntax_source.items, edit.offset);
-            try self.syntax.collectEdit(&self.syntax_highlights, .{
+            try self.syntax.collectEdit(&self.syntax_highlights, self.buffer, .{
                 .offset = edit.offset,
                 .old_end = edit.old_end,
                 .new_end = edit.new_end,
-                .inserted = self.syntax_source.items,
+                .start_point = .{ .row = edit.start_point.row, .column = edit.start_point.column },
+                .old_end_point = .{ .row = edit.old_end_point.row, .column = edit.old_end_point.column },
+                .new_end_point = .{ .row = edit.new_end_point.row, .column = edit.new_end_point.column },
             }, visible);
         } else {
-            self.syntax_source.clearRetainingCapacity();
-            try self.syntax_source.resize(self.allocator, self.buffer.byteLen());
-            self.buffer.copyRange(self.syntax_source.items, 0);
-            try self.syntax.collectFull(&self.syntax_highlights, self.syntax_source.items, visible);
+            self.syntax_highlights.clearRetainingCapacity();
+            try self.syntax.collectFull(&self.syntax_highlights, self.buffer, visible);
         }
         self.syntax_generation = self.buffer.generation;
+        self.syntax_highlight_generation = self.buffer.generation;
         self.syntax_visible = visible;
         return self.syntax_highlights.items;
+    }
+
+    fn adjustSyntaxHighlightsForLastEdit(self: *App, previous_generation: u64) void {
+        if (self.syntax_highlight_generation != previous_generation) return;
+        const edit = self.buffer.last_edit orelse return;
+        if (edit.generation != self.buffer.generation) return;
+
+        const old_len = edit.old_end - edit.offset;
+        const new_len = edit.new_end - edit.offset;
+        const grow = new_len >= old_len;
+        const delta = if (grow) new_len - old_len else old_len - new_len;
+
+        var out: usize = 0;
+        for (self.syntax_highlights.items) |span| {
+            var next = span;
+            if (next.end <= edit.offset) {
+                // unchanged
+            } else if (next.start >= edit.old_end) {
+                if (grow) {
+                    next.start += delta;
+                    next.end += delta;
+                } else {
+                    next.start -= @min(delta, next.start);
+                    next.end -= @min(delta, next.end);
+                }
+            } else {
+                // Edited-through spans are intentionally dropped until the next parse.
+                continue;
+            }
+            self.syntax_highlights.items[out] = next;
+            out += 1;
+        }
+        self.syntax_highlights.shrinkRetainingCapacity(out);
+        self.syntax_highlight_generation = self.buffer.generation;
     }
 
     fn syntaxRefreshDue(self: App, now_ns: i128) bool {
@@ -282,7 +521,9 @@ const App = struct {
         const screen = frame.current.rect();
         const command_split = screen.splitBottom(1);
         const status_split = command_split.second.splitBottom(1);
-        const editor_area = status_split.second;
+        const workspace_area = status_split.second;
+        const panel_split = if (self.undo_panel_open) workspace_area.splitRight(@min(undo_panel_width, workspace_area.width / 2)) else null;
+        const editor_area = if (panel_split) |split| split.second else workspace_area;
         const status_area = status_split.first;
         const command_area = command_split.first;
         self.editor_area = editor_area;
@@ -297,6 +538,12 @@ const App = struct {
             .highlights = highlights,
         });
         try frame.markDirty(editor_area);
+        if (panel_split) |split| {
+            try self.rebuildUndoRows();
+            self.keepUndoSelectionVisible();
+            self.renderUndoTreePanel(&frame.current, split.first);
+            try frame.markDirty(split.first);
+        }
         self.renderStatus(&frame.current, status_area);
         try frame.markDirty(status_area);
         self.renderCommand(&frame.current, command_area);
@@ -319,7 +566,17 @@ const App = struct {
             return;
         }
 
-        const editor_area = screen.splitBottom(1).second.splitBottom(1).second;
+        const workspace_area = screen.splitBottom(1).second.splitBottom(1).second;
+        if (self.undo_panel_open and self.focus == .undo_tree) {
+            const panel_area = workspace_area.splitRight(@min(undo_panel_width, workspace_area.width / 2)).first;
+            const row = self.undo_selected -| self.undo_first_row;
+            const y = @min(panel_area.y + row, panel_area.bottom() -| 1);
+            try nivi.render.AnsiRenderer.cursorTo(writer, panel_area.x, y);
+            try nivi.render.AnsiRenderer.showCursor(writer);
+            return;
+        }
+
+        const editor_area = if (self.undo_panel_open) workspace_area.splitRight(@min(undo_panel_width, workspace_area.width / 2)).second else workspace_area;
         const row = if (self.cursor_line >= self.first_line) self.cursor_line - self.first_line else 0;
         const gutter = nivi.render.gutterWidth(self.buffer.*);
         const scrolled_col = self.cursor_visual_column -| self.first_column;
@@ -328,6 +585,46 @@ const App = struct {
         const y = @min(editor_area.y + row, editor_area.bottom() -| 1);
         try nivi.render.AnsiRenderer.cursorTo(writer, x, y);
         try nivi.render.AnsiRenderer.showCursor(writer);
+    }
+
+    fn renderUndoTreePanel(self: *App, surface: *nivi.render.Surface, area: Rect) void {
+        if (area.width == 0 or area.height == 0) return;
+        const now = wallNowSeconds();
+        const panel_style: nivi.render.Style = .{ .fg = .gutter };
+        surface.fillRect(area, .space(panel_style));
+        for (0..area.height) |row| surface.putCell(area.x, area.y + row, .ascii('|', .{ .fg = .gutter }));
+        if (area.width <= 1) return;
+        const content_x = area.x + 1;
+        const content_width = area.width - 1;
+
+        const title_style: nivi.render.Style = .{ .fg = .accent, .bold = self.focus == .undo_tree };
+        surface.writeAscii(content_x, area.y, content_width, " UNDO TREE", title_style);
+        if (area.height == 1) return;
+
+        var row: usize = 1;
+        var index = self.undo_first_row;
+        while (row < area.height and index < self.undo_rows.items.len) : ({
+            row += 1;
+            index += 1;
+        }) {
+            const node = self.undo_rows.items[index];
+            const selected = index == self.undo_selected;
+            const current = node == self.buffer.undo_tree.current;
+            const style: nivi.render.Style = .{
+                .fg = if (current) .accent else .default,
+                .bg = if (selected and self.focus == .undo_tree) .selection else .default,
+                .bold = current,
+            };
+            var buf: [128]u8 = undefined;
+            var time_buf: [24]u8 = undefined;
+            var age_buf: [24]u8 = undefined;
+            const indent = @min(node.depth * 2, 16);
+            const marker: u8 = if (current) '@' else if (node.children.items.len != 0) '*' else 'o';
+            const clock = if (node.timestamp == 0) "root" else formatClock(&time_buf, node.timestamp);
+            const age = if (node.timestamp == 0) "" else formatAge(&age_buf, now - node.timestamp);
+            const text = std.fmt.bufPrint(&buf, " {s}{c} {d}  {s} {s}", .{ spaces(indent), marker, node.seq, clock, age }) catch "undo row";
+            surface.writeAscii(content_x, area.y + row, content_width, text, style);
+        }
     }
 
     fn renderStatus(self: *App, surface: *nivi.render.Surface, area: Rect) void {
@@ -343,9 +640,13 @@ const App = struct {
             .visual => "VISUAL",
             .visual_line => "V-LINE",
         };
+        const focus = switch (self.focus) {
+            .editor => "editor",
+            .undo_tree => "undotree",
+        };
         const line = self.cursor_line + 1;
         const col = self.cursor_visual_column + 1;
-        const text = std.fmt.bufPrint(&buf, " {s} {s}{s}  {d}:{d}  {d} bytes", .{ mode, name, if (self.buffer.dirty) " [+]" else "", line, col, self.buffer.byteLen() }) catch " status error";
+        const text = std.fmt.bufPrint(&buf, " {s} {s}{s}  {d}:{d}  {d} bytes  [{s}]", .{ mode, name, if (self.buffer.dirty) " [+]" else "", line, col, self.buffer.byteLen(), focus }) catch " status error";
         surface.writeAscii(area.x, area.y, area.width, text, status_style);
     }
 
@@ -367,6 +668,38 @@ fn monotonicNowNs() i128 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+fn undoTimestamp() i64 {
+    return wallNowSeconds();
+}
+
+fn spaces(count: usize) []const u8 {
+    const all = "                ";
+    return all[0..@min(count, all.len)];
+}
+
+fn wallNowSeconds() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return ts.sec;
+}
+
+fn formatClock(buf: []u8, timestamp: i64) []const u8 {
+    if (timestamp <= 0) return "--:--";
+    const seconds: u64 = @intCast(timestamp);
+    const day = (std.time.epoch.EpochSeconds{ .secs = seconds }).getDaySeconds();
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ day.getHoursIntoDay(), day.getMinutesIntoHour() }) catch "--:--";
+}
+
+fn formatAge(buf: []u8, age_seconds: i64) []const u8 {
+    const seconds = @max(age_seconds, 0);
+    if (seconds < 60) return std.fmt.bufPrint(buf, "{d}s ago", .{seconds}) catch "? ago";
+    const minutes = @divTrunc(seconds, 60);
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m ago", .{minutes}) catch "? ago";
+    const hours = @divTrunc(minutes, 60);
+    if (hours < 24) return std.fmt.bufPrint(buf, "{d}h ago", .{hours}) catch "? ago";
+    return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(hours, 24)}) catch "? ago";
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -430,6 +763,7 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
 
     var frame = try nivi.render.FrameRenderer.init(allocator, size.width, size.height);
     defer frame.deinit();
+    buffer.undo_tree.clock = undoTimestamp;
 
     var app: App = .{
         .allocator = allocator,
@@ -438,7 +772,7 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
         .cursor = Cursor.init(buffer.*),
         .selection = Selection.init(buffer.*),
         .vim = nivi.vim.State.init(allocator),
-        .syntax = try nivi.syntax.Highlighter.init(allocator, buffer.path),
+        .syntax = try nivi.syntax.Highlighter.init(io, allocator, buffer.path),
     };
     defer app.deinit();
 
@@ -648,4 +982,192 @@ fn trimLeft(text: []const u8) []const u8 {
     var index: usize = 0;
     while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
     return text[index..];
+}
+
+test "app groups insert-mode typing into one undo node" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+    };
+    defer app.deinit();
+
+    app.setMode(.insert);
+    try app.handleInsert(.{ .char = 'a' });
+    try app.handleInsert(.{ .char = 'b' });
+    app.setMode(.normal);
+
+    try std.testing.expectEqual(@as(usize, 1), buffer.undo_tree.root.children.items.len);
+    try std.testing.expectEqualStrings("ab", buffer.undo_tree.root.children.items[0].edits.items[0].new_text.items);
+}
+
+test "app undo after insert-mode typing removes whole group" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.{ .char = 'a' });
+    try app.handleKey(.{ .char = 'b' });
+    try app.handleKey(.{ .char = 'c' });
+    try app.handleKey(.escape);
+    try app.handleKey(.{ .char = 'u' });
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "undo panel render does not split active insert group" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .undo_panel_open = true,
+    };
+    defer app.deinit();
+    var surface = try nivi.render.Surface.init(std.testing.allocator, 40, 8);
+    defer surface.deinit();
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.{ .char = 'a' });
+    app.renderUndoTreePanel(&surface, surface.rect());
+    try app.handleKey(.{ .char = 'b' });
+    app.renderUndoTreePanel(&surface, surface.rect());
+    try app.handleKey(.escape);
+    try app.handleKey(.{ .char = 'u' });
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "command mode is available from undo tree focus" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .undo_panel_open = true,
+        .focus = .undo_tree,
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = ':' });
+    try std.testing.expectEqual(Mode.command, app.mode);
+}
+
+test "undo timestamps format as clock plus relative age" {
+    var clock_buf: [16]u8 = undefined;
+    var age_buf: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("--:--", formatClock(&clock_buf, 0));
+    try std.testing.expectEqualStrings("5s ago", formatAge(&age_buf, 5));
+    try std.testing.expectEqualStrings("2m ago", formatAge(&age_buf, 125));
+    try std.testing.expectEqualStrings("3h ago", formatAge(&age_buf, 3 * 60 * 60));
+}
+
+test "syntax refresh waits for insert-mode idle" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, "test.zig"),
+    };
+    defer app.deinit();
+    if (!app.syntax.enabled()) return;
+    app.syntax_generation = buffer.generation;
+
+    app.setMode(.insert);
+    try app.handleKey(.{ .char = 'a' });
+    try std.testing.expect(!app.syntaxRefreshDue(app.syntax_refresh_after_ns - 1));
+    try std.testing.expect(app.syntaxRefreshDue(app.syntax_refresh_after_ns));
+
+    app.setMode(.normal);
+    try std.testing.expect(app.syntaxRefreshDue(monotonicNowNs()));
+}
+
+test "cached syntax spans follow insert edits" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "const x");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .syntax_highlight_generation = buffer.generation,
+    };
+    defer app.deinit();
+    try app.syntax_highlights.append(std.testing.allocator, .{ .start = 0, .end = 5, .kind = .keyword });
+    try app.syntax_highlights.append(std.testing.allocator, .{ .start = 6, .end = 7, .kind = .type });
+
+    const previous_generation = buffer.generation;
+    try buffer.insert(0, "a");
+    app.adjustSyntaxHighlightsForLastEdit(previous_generation);
+
+    try std.testing.expectEqual(@as(usize, 2), app.syntax_highlights.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.syntax_highlights.items[0].start);
+    try std.testing.expectEqual(@as(usize, 6), app.syntax_highlights.items[0].end);
+    try std.testing.expectEqual(@as(usize, 7), app.syntax_highlights.items[1].start);
+    try std.testing.expectEqual(@as(usize, 8), app.syntax_highlights.items[1].end);
+}
+
+test "cached syntax drops edited span and shifts later spans" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "const x");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .syntax_highlight_generation = buffer.generation,
+    };
+    defer app.deinit();
+    try app.syntax_highlights.append(std.testing.allocator, .{ .start = 0, .end = 5, .kind = .keyword });
+    try app.syntax_highlights.append(std.testing.allocator, .{ .start = 6, .end = 7, .kind = .type });
+
+    const previous_generation = buffer.generation;
+    try buffer.insert(2, "z");
+    app.adjustSyntaxHighlightsForLastEdit(previous_generation);
+
+    try std.testing.expectEqual(@as(usize, 1), app.syntax_highlights.items.len);
+    try std.testing.expectEqual(@as(usize, 7), app.syntax_highlights.items[0].start);
+    try std.testing.expectEqual(@as(usize, 8), app.syntax_highlights.items[0].end);
 }

@@ -643,6 +643,26 @@ pub const Rope = struct {
         copyNodeRange(self.root, offset, out.len, out, &index);
     }
 
+    /// Returns the contiguous leaf bytes beginning at `offset`. The slice stays
+    /// valid until the rope is mutated.
+    pub fn chunkAt(self: Rope, offset: usize) []const u8 {
+        std.debug.assert(offset <= self.byteLen());
+        if (offset == self.byteLen()) return &.{};
+        var current = self.root orelse return &.{};
+        var remaining = offset;
+        while (true) switch (current.*) {
+            .leaf => |leaf| return leaf.data.text[remaining..leaf.len],
+            .branch => |branch| {
+                if (remaining < branch.weight) {
+                    current = branch.left;
+                } else {
+                    remaining -= branch.weight;
+                    current = branch.right;
+                }
+            },
+        };
+    }
+
     pub fn validate(self: Rope) ValidationError!void {
         const validation = try validateNode(self.root);
         if (validation.byte_len != self.byteLen()) return error.WrongByteLen;
@@ -1826,6 +1846,28 @@ test "copies byte ranges across leaves" {
     var out: [Rope.leaf_capacity + 17]u8 = undefined;
     rope.copyRange(&out, Rope.leaf_capacity - 9);
     try std.testing.expectEqualSlices(u8, base[Rope.leaf_capacity - 9 ..][0..out.len], &out);
+}
+
+test "chunkAt streams contiguous leaf slices" {
+    var rope = Rope.init(std.testing.allocator);
+    defer rope.deinit();
+
+    var base: [Rope.leaf_capacity * 3 + 11]u8 = undefined;
+    for (&base, 0..) |*byte, index| byte.* = @intCast('A' + index % 26);
+    try rope.setText(&base);
+
+    var streamed: std.ArrayListUnmanaged(u8) = .empty;
+    defer streamed.deinit(std.testing.allocator);
+    var offset: usize = 0;
+    while (offset < rope.byteLen()) {
+        const chunk = rope.chunkAt(offset);
+        try std.testing.expect(chunk.len != 0);
+        try streamed.appendSlice(std.testing.allocator, chunk);
+        offset += chunk.len;
+    }
+
+    try std.testing.expectEqualSlices(u8, &base, streamed.items);
+    try std.testing.expectEqual(@as(usize, 0), rope.chunkAt(rope.byteLen()).len);
 }
 
 test "maps line ranges to byte ranges" {

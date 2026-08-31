@@ -13,11 +13,18 @@ pub const Buffer = struct {
     pub const LineEnding = enum { lf, crlf };
     pub const BoundaryMode = Rope.BoundaryMode;
     pub const ByteRange = Rope.ByteRange;
+    pub const BytePoint = struct {
+        row: u32,
+        column: u32,
+    };
     pub const EditDelta = struct {
         generation: u64,
         offset: usize,
         old_end: usize,
         new_end: usize,
+        start_point: BytePoint,
+        old_end_point: BytePoint,
+        new_end_point: BytePoint,
     };
 
     rope: Rope,
@@ -88,15 +95,32 @@ pub const Buffer = struct {
         self.dirty = true;
     }
 
-    fn touchEdit(self: *Buffer, offset: usize, deleted_len: usize, inserted_len: usize) void {
-        self.generation += 1;
-        self.last_edit = .{
-            .generation = self.generation,
+    fn prepareEdit(self: Buffer, offset: usize, deleted_len: usize, inserted: []const u8) EditDelta {
+        const start_point = self.pointAt(offset);
+        return .{
+            .generation = 0,
             .offset = offset,
             .old_end = offset + deleted_len,
-            .new_end = offset + inserted_len,
+            .new_end = offset + inserted.len,
+            .start_point = start_point,
+            .old_end_point = self.pointAt(offset + deleted_len),
+            .new_end_point = pointAfterText(start_point, inserted),
         };
+    }
+
+    fn touchEdit(self: *Buffer, delta: EditDelta) void {
+        self.generation += 1;
+        self.last_edit = delta;
+        self.last_edit.?.generation = self.generation;
         self.dirty = true;
+    }
+
+    fn pointAt(self: Buffer, offset: usize) BytePoint {
+        const line = self.rope.lineAt(offset);
+        return .{
+            .row = @intCast(line),
+            .column = @intCast(offset - self.rope.byteOffsetForLine(line)),
+        };
     }
 
     pub fn byteLen(self: Buffer) usize {
@@ -144,6 +168,10 @@ pub const Buffer = struct {
         self.rope.copyRange(out, offset);
     }
 
+    pub fn chunkAt(self: Buffer, offset: usize) []const u8 {
+        return self.rope.chunkAt(offset);
+    }
+
     pub fn toOwnedSlice(self: Buffer, allocator: std.mem.Allocator) ![]u8 {
         return self.rope.toOwnedSlice(allocator);
     }
@@ -158,36 +186,40 @@ pub const Buffer = struct {
 
     pub fn insert(self: *Buffer, offset: usize, text: []const u8) !void {
         if (text.len == 0) return;
+        const delta = self.prepareEdit(offset, 0, text);
         try self.undo_tree.recordInsertion(offset, text);
         try self.rope.insert(offset, text);
-        self.touchEdit(offset, 0, text.len);
+        self.touchEdit(delta);
     }
 
     pub fn delete(self: *Buffer, offset: usize, len: usize) !void {
         if (len == 0) return;
+        const delta = self.prepareEdit(offset, len, "");
         try self.recordDeletionRange(offset, len);
         try self.rope.delete(offset, len);
-        self.touchEdit(offset, len, 0);
+        self.touchEdit(delta);
     }
 
     pub fn replace(self: *Buffer, offset: usize, len: usize, text: []const u8) !void {
         if (len == 0 and text.len == 0) return;
+        const delta = self.prepareEdit(offset, len, text);
         self.delete_scratch.clearRetainingCapacity();
         try self.delete_scratch.resize(self.allocator, len);
         self.copyRange(self.delete_scratch.items, offset);
         try self.undo_tree.recordReplacement(offset, self.delete_scratch.items, text);
         if (len != 0) try self.rope.delete(offset, len);
         if (text.len != 0) try self.rope.insert(offset, text);
-        self.touchEdit(offset, len, text.len);
+        self.touchEdit(delta);
     }
 
     pub fn insertUtf8(self: *Buffer, offset: usize, text: []const u8, mode: BoundaryMode) !usize {
         if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidCodepoint;
         const at = try self.rope.resolveUtf8Boundary(offset, mode);
         if (text.len != 0) {
+            const delta = self.prepareEdit(at, 0, text);
             try self.undo_tree.recordInsertion(at, text);
             try self.rope.insert(at, text);
-            self.touchEdit(at, 0, text.len);
+            self.touchEdit(delta);
         }
         return at;
     }
@@ -203,9 +235,10 @@ pub const Buffer = struct {
     /// Replace the whole buffer. Resets the undo tree (new file baseline).
     pub fn setText(self: *Buffer, text: []const u8) !void {
         const old_len = self.byteLen();
+        const delta = self.prepareEdit(0, old_len, text);
         try self.rope.setText(text);
         try self.undo_tree.reset();
-        self.touchEdit(0, old_len, text.len);
+        self.touchEdit(delta);
     }
 
     pub fn markSaved(self: *Buffer) void {
@@ -319,9 +352,10 @@ pub const Buffer = struct {
 
     /// Apply an edit without recording it (used by undo/redo/jump).
     fn applyRaw(self: *Buffer, offset: usize, del_len: usize, ins_text: []const u8) !void {
+        const delta = self.prepareEdit(offset, del_len, ins_text);
         if (del_len != 0) try self.rope.delete(offset, del_len);
         if (ins_text.len != 0) try self.rope.insert(offset, ins_text);
-        self.touchEdit(offset, del_len, ins_text.len);
+        self.touchEdit(delta);
     }
 
     fn recordDeletionRange(self: *Buffer, offset: usize, len: usize) !void {
@@ -336,6 +370,19 @@ pub const Buffer = struct {
         self.path = copy;
     }
 };
+
+fn pointAfterText(start: Buffer.BytePoint, text: []const u8) Buffer.BytePoint {
+    var point = start;
+    for (text) |byte| {
+        if (byte == '\n') {
+            point.row += 1;
+            point.column = 0;
+        } else {
+            point.column += 1;
+        }
+    }
+    return point;
+}
 
 fn indexOfChild(node: *Node) usize {
     const parent = node.parent.?;
@@ -396,8 +443,8 @@ pub const Cursor = struct {
         }
     }
 
-    fn adoptRopeCursor(self: *Cursor, buffer: *Buffer, offset: usize, deleted_len: usize, inserted_len: usize) void {
-        buffer.touchEdit(offset, deleted_len, inserted_len);
+    fn adoptRopeCursor(self: *Cursor, buffer: *Buffer, delta: Buffer.EditDelta) void {
+        buffer.touchEdit(delta);
         self.offset = self.rope_cursor.offset;
         self.generation = buffer.generation;
         self.rope_cursor_generation = buffer.generation;
@@ -412,8 +459,9 @@ pub const Cursor = struct {
         try buffer.undo_tree.recordInsertion(self.offset, text);
         self.ensureRopeCursor(buffer);
         const offset = self.offset;
+        const delta = buffer.prepareEdit(offset, 0, text);
         try buffer.rope.insertAtCursor(&self.rope_cursor, text);
-        self.adoptRopeCursor(buffer, offset, 0, text.len);
+        self.adoptRopeCursor(buffer, delta);
     }
 
     /// Delete the grapheme cluster before the caret (Backspace).
@@ -421,10 +469,11 @@ pub const Cursor = struct {
         try self.sync(buffer.*);
         if (self.offset == 0) return;
         const prev = try buffer.rope.prevGraphemeBoundary(self.offset);
+        const delta = buffer.prepareEdit(prev, self.offset - prev, "");
         try buffer.recordDeletionRange(prev, self.offset - prev);
         self.ensureRopeCursor(buffer);
         try buffer.rope.deleteBeforeCursor(&self.rope_cursor, self.offset - prev);
-        self.adoptRopeCursor(buffer, prev, self.offset - prev, 0);
+        self.adoptRopeCursor(buffer, delta);
     }
 
     /// Delete the grapheme cluster at the caret (Delete).
@@ -432,11 +481,11 @@ pub const Cursor = struct {
         try self.sync(buffer.*);
         if (self.offset >= buffer.byteLen()) return;
         const next = try buffer.rope.nextGraphemeBoundary(self.offset);
+        const delta = buffer.prepareEdit(self.offset, next - self.offset, "");
         try buffer.recordDeletionRange(self.offset, next - self.offset);
         self.ensureRopeCursor(buffer);
-        const offset = self.offset;
         try buffer.rope.deleteAtCursor(&self.rope_cursor, next - self.offset);
-        self.adoptRopeCursor(buffer, offset, next - offset, 0);
+        self.adoptRopeCursor(buffer, delta);
     }
 
     pub fn line(self: *Cursor, buffer: Buffer) !usize {
@@ -578,6 +627,18 @@ test "buffer tracks generation and dirty flag" {
 
     buffer.markSaved();
     try std.testing.expect(!buffer.dirty);
+}
+
+test "edit delta records pre-edit and post-edit byte points" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one\ntwo\nthree");
+    defer buffer.deinit();
+
+    try buffer.replace(2, 5, "x\ny");
+    const edit = buffer.last_edit.?;
+
+    try std.testing.expectEqual(Buffer.BytePoint{ .row = 0, .column = 2 }, edit.start_point);
+    try std.testing.expectEqual(Buffer.BytePoint{ .row = 1, .column = 3 }, edit.old_end_point);
+    try std.testing.expectEqual(Buffer.BytePoint{ .row = 1, .column = 1 }, edit.new_end_point);
 }
 
 test "buffer loads and saves files" {

@@ -37,6 +37,7 @@
             export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/global"
             export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/local"
             export TREE_SITTER_ZIG_PARSER="${pkgs.tree-sitter-grammars.tree-sitter-zig}/parser"
+            export TREE_SITTER_ZIG_HIGHLIGHTS="${pkgs.tree-sitter-grammars.tree-sitter-zig}/queries/highlights.scm"
             echo "nivi dev shell: zig $(zig version)"
           '';
         };

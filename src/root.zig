@@ -3,6 +3,7 @@ pub const Buffer = @import("buffer.zig").Buffer;
 pub const Cursor = @import("buffer.zig").Cursor;
 pub const Selection = @import("buffer.zig").Selection;
 pub const UndoTree = @import("undotree.zig").UndoTree;
+pub const UndoNode = @import("undotree.zig").Node;
 pub const render = @import("render.zig");
 pub const input = @import("input.zig");
 pub const terminal = @import("terminal.zig");

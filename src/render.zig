@@ -7,6 +7,7 @@ pub const Color = enum(u8) {
     gutter,
     status,
     selection,
+    selection_text,
     accent,
     syntax_keyword,
     syntax_string,
@@ -14,6 +15,11 @@ pub const Color = enum(u8) {
     syntax_number,
     syntax_builtin,
     syntax_type,
+    syntax_function,
+    syntax_variable,
+    syntax_constant,
+    syntax_operator,
+    syntax_punctuation,
 };
 
 pub const Style = struct {
@@ -367,18 +373,28 @@ pub const AnsiRenderer = struct {
     fn writeColor(writer: *std.Io.Writer, base: u8, color: Color) !void {
         const code: ?u8 = switch (color) {
             .default => null,
-            .gutter => base + 8,
+            .gutter => brightCode(base, 0),
             .status => base + 4,
-            .selection => base + 6,
+            .selection => brightCode(base, 0),
+            .selection_text => brightCode(base, 7),
             .accent => base + 2,
             .syntax_keyword => base + 5,
             .syntax_string => base + 2,
-            .syntax_comment => base + 8,
+            .syntax_comment => brightCode(base, 0),
             .syntax_number => base + 3,
             .syntax_builtin => base + 1,
             .syntax_type => base + 4,
+            .syntax_function => base + 6,
+            .syntax_variable => null,
+            .syntax_constant => base + 3,
+            .syntax_operator => base + 5,
+            .syntax_punctuation => brightCode(base, 0),
         };
         if (code) |value| try writer.print(";{d}", .{value});
+    }
+
+    fn brightCode(base: u8, color_offset: u8) u8 {
+        return (if (base == 30) @as(u8, 90) else 100) + color_offset;
     }
 };
 
@@ -576,7 +592,10 @@ fn styleForByte(offset: usize, selection: ?Buffer.ByteRange, highlights: ?[]cons
     var style: Style = .{};
     if (highlightForByte(offset, highlights)) |kind| style.fg = colorForHighlight(kind);
     if (selection) |range| {
-        if (offset >= range.start and offset < range.end) style.bg = .selection;
+        if (offset >= range.start and offset < range.end) {
+            style.bg = .selection;
+            if (style.fg == .syntax_comment or style.fg == .syntax_punctuation) style.fg = .selection_text;
+        }
     }
     return style;
 }
@@ -607,6 +626,15 @@ fn colorForHighlight(kind: syntax.HighlightKind) Color {
         .number => .syntax_number,
         .builtin => .syntax_builtin,
         .type => .syntax_type,
+        .function => .syntax_function,
+        .variable => .syntax_variable,
+        .constant => .syntax_constant,
+        .operator => .syntax_operator,
+        .punctuation => .syntax_punctuation,
+        .character => .syntax_string,
+        .boolean => .syntax_constant,
+        .label => .syntax_constant,
+        .module => .syntax_type,
     };
 }
 
@@ -802,15 +830,26 @@ test "viewport highlights selected bytes" {
     var surface = try Surface.init(std.testing.allocator, 4, 1);
     defer surface.deinit();
 
+    const highlights = [_]syntax.HighlightSpan{.{ .start = 1, .end = 3, .kind = .punctuation }};
     try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{
         .line_numbers = false,
         .selection = .{ .start = 1, .end = 3 },
+        .highlights = &highlights,
     });
 
     try std.testing.expectEqual(Color.default, surface.cellAt(0, 0).style.bg);
     try std.testing.expectEqual(Color.selection, surface.cellAt(1, 0).style.bg);
     try std.testing.expectEqual(Color.selection, surface.cellAt(2, 0).style.bg);
     try std.testing.expectEqual(Color.default, surface.cellAt(3, 0).style.bg);
+    try std.testing.expectEqual(Color.selection_text, surface.cellAt(1, 0).style.fg);
+    try std.testing.expectEqual(Color.selection_text, surface.cellAt(2, 0).style.fg);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try AnsiRenderer.renderFull(&out.writer, surface);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ";100m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ";97;100m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), ";46m") == null);
 }
 
 test "viewport applies syntax highlight spans" {
@@ -828,6 +867,26 @@ test "viewport applies syntax highlight spans" {
     try std.testing.expectEqual(Color.syntax_keyword, surface.cellAt(0, 0).style.fg);
     try std.testing.expectEqual(Color.syntax_keyword, surface.cellAt(4, 0).style.fg);
     try std.testing.expectEqual(Color.default, surface.cellAt(5, 0).style.fg);
+}
+
+test "viewport and ansi renderer color comments gray" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "// hi");
+    defer buffer.deinit();
+    var surface = try Surface.init(std.testing.allocator, 5, 1);
+    defer surface.deinit();
+
+    const highlights = [_]syntax.HighlightSpan{.{ .start = 0, .end = 5, .kind = .comment }};
+    try renderBufferViewport(std.testing.allocator, &surface, surface.rect(), buffer, .{
+        .line_numbers = false,
+        .highlights = &highlights,
+    });
+    try std.testing.expectEqual(Color.syntax_comment, surface.cellAt(0, 0).style.fg);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try AnsiRenderer.renderFull(&out.writer, surface);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[0;90m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\x1b[0;38m") == null);
 }
 
 test "viewport renders wide unicode using display columns" {

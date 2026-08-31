@@ -239,6 +239,7 @@ pub const UndoTree = struct {
 
     /// Turn the open transaction into a new child node of `current`.
     pub fn commitOpen(self: *UndoTree) void {
+        if (self.group_depth != 0) return;
         var open = self.open orelse return;
         self.open = null;
         if (open.edits.items.len == 0) {
@@ -316,6 +317,21 @@ test "grouped edits coalesce into one node" {
     try std.testing.expectEqualStrings("hello", node.edits.items[0].new_text.items);
     try std.testing.expectEqual(@as(usize, 0), node.cursor_before);
     try std.testing.expectEqual(@as(usize, 5), node.cursor_after);
+}
+
+test "open group cannot be committed by observers" {
+    var tree = try UndoTree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    tree.beginGroup(0);
+    try tree.recordInsertion(0, "a");
+    tree.commitOpen();
+    try std.testing.expectEqual(@as(usize, 0), tree.root.children.items.len);
+    try tree.recordInsertion(1, "b");
+    tree.endGroup(2);
+
+    try std.testing.expectEqual(@as(usize, 1), tree.root.children.items.len);
+    try std.testing.expectEqualStrings("ab", tree.root.children.items[0].edits.items[0].new_text.items);
 }
 
 test "findBySeq locates nodes" {
