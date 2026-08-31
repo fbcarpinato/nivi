@@ -280,7 +280,7 @@ pub const Buffer = struct {
         const node = self.undo_tree.current;
         const parent = node.parent orelse return null;
         try self.applyNodeInverse(node);
-        self.undo_tree.current = parent;
+        self.undo_tree.setCurrent(parent);
         return node.cursor_before;
     }
 
@@ -290,8 +290,8 @@ pub const Buffer = struct {
         self.undo_tree.commitOpen();
         const child = self.undo_tree.redoChild() orelse return null;
         try self.applyNodeForward(child);
-        child.parent.?.last_visited = indexOfChild(child);
-        self.undo_tree.current = child;
+        self.undo_tree.setLastVisited(child.parent.?, indexOfChild(child));
+        self.undo_tree.setCurrent(child);
         return child.cursor_after;
     }
 
@@ -306,7 +306,7 @@ pub const Buffer = struct {
         while (self.undo_tree.current != ancestor) {
             const node = self.undo_tree.current;
             try self.applyNodeInverse(node);
-            self.undo_tree.current = node.parent.?;
+            self.undo_tree.setCurrent(node.parent.?);
         }
 
         // Collect the downward path (ancestor -> target), then apply it forward.
@@ -321,9 +321,9 @@ pub const Buffer = struct {
             index -= 1;
             const node = self.jump_scratch.items[index];
             try self.applyNodeForward(node);
-            node.parent.?.last_visited = indexOfChild(node);
+            self.undo_tree.setLastVisited(node.parent.?, indexOfChild(node));
         }
-        self.undo_tree.current = target;
+        self.undo_tree.setCurrent(target);
         return target.cursor_after;
     }
 

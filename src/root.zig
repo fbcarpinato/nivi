@@ -9,6 +9,9 @@ pub const input = @import("input.zig");
 pub const terminal = @import("terminal.zig");
 pub const vim = @import("vim.zig");
 pub const syntax = @import("syntax.zig");
+pub const component = @import("component_api.zig");
+pub const UndoTreePanel = @import("undo_tree_panel.zig").UndoTreePanel;
+pub const Workspace = @import("workspace.zig").Workspace;
 
 test {
     _ = @import("rope.zig");
@@ -19,4 +22,7 @@ test {
     _ = @import("terminal.zig");
     _ = @import("vim.zig");
     _ = @import("syntax.zig");
+    _ = @import("component_api.zig");
+    _ = @import("undo_tree_panel.zig");
+    _ = @import("workspace.zig");
 }

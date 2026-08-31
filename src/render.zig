@@ -423,6 +423,11 @@ pub const FrameRenderer = struct {
         self.dirty_rects.clearRetainingCapacity();
     }
 
+    pub fn beginRetainedFrame(self: *FrameRenderer) void {
+        self.current.copyFrom(self.previous);
+        self.dirty_rects.clearRetainingCapacity();
+    }
+
     pub fn markDirty(self: *FrameRenderer, rect: Rect) !void {
         if (rect.width == 0 or rect.height == 0) return;
         try self.dirty_rects.append(self.current.allocator, rect);
@@ -994,4 +999,16 @@ test "frame renderer swaps current into previous after present" {
 
     try std.testing.expect(!renderer.first_frame);
     try std.testing.expect(Cell.eql(renderer.previous.cellAt(2, 0).*, renderer.current.cellAt(2, 0).*));
+}
+
+test "retained frame starts from previous component cells" {
+    var frame = try FrameRenderer.init(std.testing.allocator, 3, 1);
+    defer frame.deinit();
+    frame.previous.putCell(1, 0, .ascii('x', .{ .fg = .accent }));
+
+    frame.beginRetainedFrame();
+
+    try std.testing.expectEqualStrings("x", frame.current.cellAt(1, 0).slice());
+    try std.testing.expectEqual(Color.accent, frame.current.cellAt(1, 0).style.fg);
+    try std.testing.expectEqual(@as(usize, 0), frame.dirty_rects.items.len);
 }

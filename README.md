@@ -270,8 +270,18 @@ Ordered roughly by expected impact. None of these are implemented yet.
       `AnsiRenderer.renderDiffRects`); the editor loop marks editor/status/command
       regions so present only scans changed regions.
 - [x] Syntax/highlight spans layered over viewport cells (first-pass Tree-sitter Zig support).
-- [ ] Component scheduler with focus, z-order traversal, and command routing.
-- [ ] Per-component dirty tracking driven by buffer generation ranges.
+- [x] Tagged component store, split-layout workspace, spatial focus, and semantic action routing.
+- [x] Retained component rendering with dirty flags and undo structure/state generations.
+- [ ] Overlay z-order traversal and modal component stacking.
+
+### Component architecture
+- [x] `Workspace` owns component IDs, lifecycle, split layout, and directional focus.
+- [x] Built-in components use a statically dispatched tagged union rather than per-frame vtables.
+- [x] `UndoTreePanel` owns cached value rows, selection, scrolling, rendering, and input actions.
+- [x] Global key sequence table maps `,ut` to workspace commands without panel-specific leader state.
+- [x] Undo row projection is iterative and only rebuilds when `structure_generation` changes.
+- [x] Reset epochs prevent cached selections from referring to reused undo sequence IDs.
+- [ ] Add file-tree, diagnostics, and picker components through the same action/layout APIs.
 
 ### Syntax architecture
 - [x] Tree-sitter runtime wrapper for parser/tree/node ownership.

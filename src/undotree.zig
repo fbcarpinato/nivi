@@ -64,6 +64,12 @@ pub const UndoTree = struct {
     root: *Node,
     current: *Node,
     next_seq: u64 = 1,
+    /// Changes when nodes are added or reset invalidates prior node identities.
+    structure_generation: u64 = 1,
+    /// Changes when the current state or preferred redo branch changes.
+    state_generation: u64 = 1,
+    /// Changes on reset, when sequence IDs begin again from zero.
+    epoch: u64 = 1,
     open: ?OpenTransaction = null,
     group_depth: usize = 0,
     clock: *const fn () i64 = zeroClock,
@@ -115,6 +121,9 @@ pub const UndoTree = struct {
         self.root.last_visited = 0;
         self.current = self.root;
         self.next_seq = 1;
+        self.structure_generation +%= 1;
+        self.state_generation +%= 1;
+        self.epoch +%= 1;
     }
 
     pub fn canUndo(self: UndoTree) bool {
@@ -135,6 +144,18 @@ pub const UndoTree = struct {
 
     pub fn findBySeq(self: UndoTree, seq: u64) ?*Node {
         return self.index.get(seq);
+    }
+
+    pub fn setCurrent(self: *UndoTree, node: *Node) void {
+        if (self.current == node) return;
+        self.current = node;
+        self.state_generation +%= 1;
+    }
+
+    pub fn setLastVisited(self: *UndoTree, parent: *Node, index: usize) void {
+        if (parent.last_visited == index) return;
+        parent.last_visited = index;
+        self.state_generation +%= 1;
     }
 
     /// Lowest common ancestor of two nodes (both belong to this tree).
@@ -268,6 +289,8 @@ pub const UndoTree = struct {
         self.index.putAssumeCapacity(node.seq, node);
         self.current = node;
         self.next_seq += 1;
+        self.structure_generation +%= 1;
+        self.state_generation +%= 1;
         open.edits = .empty; // ownership moved into `node`
     }
 
@@ -292,7 +315,7 @@ test "records and branches without discarding redo" {
     try std.testing.expect(tree.canUndo());
 
     // Move back to the "a" state, then branch.
-    tree.current = node_a;
+    tree.setCurrent(node_a);
     try std.testing.expect(tree.canRedo());
     try tree.recordInsertion(1, "c");
 
@@ -343,4 +366,26 @@ test "findBySeq locates nodes" {
     try std.testing.expectEqual(tree.current, tree.findBySeq(seq).?);
     try std.testing.expectEqual(tree.root, tree.findBySeq(0).?);
     try std.testing.expectEqual(@as(?*Node, null), tree.findBySeq(9999));
+}
+
+test "tracks structure state and reset generations" {
+    var tree = try UndoTree.init(std.testing.allocator);
+    defer tree.deinit();
+    const structure = tree.structure_generation;
+    const state = tree.state_generation;
+    const epoch = tree.epoch;
+
+    try tree.recordInsertion(0, "x");
+    try std.testing.expect(tree.structure_generation > structure);
+    try std.testing.expect(tree.state_generation > state);
+    const after_insert_structure = tree.structure_generation;
+    const after_insert_state = tree.state_generation;
+
+    tree.setCurrent(tree.root);
+    try std.testing.expectEqual(after_insert_structure, tree.structure_generation);
+    try std.testing.expect(tree.state_generation > after_insert_state);
+
+    try tree.reset();
+    try std.testing.expect(tree.structure_generation > after_insert_structure);
+    try std.testing.expect(tree.epoch > epoch);
 }
