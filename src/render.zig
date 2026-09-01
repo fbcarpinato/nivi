@@ -418,6 +418,22 @@ pub const FrameRenderer = struct {
         self.* = undefined;
     }
 
+    pub fn resize(self: *FrameRenderer, width: usize, height: usize) !void {
+        if (self.current.width == width and self.current.height == height) return;
+
+        var previous = try Surface.init(self.current.allocator, width, height);
+        errdefer previous.deinit();
+        var current = try Surface.init(self.current.allocator, width, height);
+        errdefer current.deinit();
+
+        self.previous.deinit();
+        self.current.deinit();
+        self.previous = previous;
+        self.current = current;
+        self.first_frame = true;
+        self.dirty_rects.clearRetainingCapacity();
+    }
+
     pub fn beginFrame(self: *FrameRenderer, style: Style) void {
         self.current.clear(style);
         self.dirty_rects.clearRetainingCapacity();
@@ -999,6 +1015,22 @@ test "frame renderer swaps current into previous after present" {
 
     try std.testing.expect(!renderer.first_frame);
     try std.testing.expect(Cell.eql(renderer.previous.cellAt(2, 0).*, renderer.current.cellAt(2, 0).*));
+}
+
+test "frame renderer resize replaces surfaces and forces full render" {
+    var renderer = try FrameRenderer.init(std.testing.allocator, 4, 2);
+    defer renderer.deinit();
+    renderer.first_frame = false;
+    try renderer.markDirty(renderer.current.rect());
+
+    try renderer.resize(7, 3);
+
+    try std.testing.expectEqual(@as(usize, 7), renderer.current.width);
+    try std.testing.expectEqual(@as(usize, 3), renderer.current.height);
+    try std.testing.expectEqual(@as(usize, 7), renderer.previous.width);
+    try std.testing.expectEqual(@as(usize, 3), renderer.previous.height);
+    try std.testing.expect(renderer.first_frame);
+    try std.testing.expectEqual(@as(usize, 0), renderer.dirty_rects.items.len);
 }
 
 test "retained frame starts from previous component cells" {

@@ -876,6 +876,13 @@ fn runFullscreen(io: Io, allocator: std.mem.Allocator, buffer: *Buffer, size: ni
     var pending_len: usize = 0;
     var read_buf: [256]u8 = undefined;
     while (!app.should_quit) {
+        if (nivi.terminal.detectedSize(std.posix.STDOUT_FILENO)) |detected| {
+            if (frame.current.width != detected.width or frame.current.height != detected.height) {
+                try frame.resize(detected.width, detected.height);
+                app.needs_render = true;
+            }
+        }
+
         const now_ns = monotonicNowNs();
         if (app.needs_render or app.syntaxRefreshDue(now_ns)) {
             try app.render(&frame, now_ns);

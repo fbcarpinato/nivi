@@ -48,16 +48,16 @@ pub fn supportsRawMode() bool {
 }
 
 pub fn size(stdout_fd: std.posix.fd_t, environ: std.process.Environ.Map) Size {
-    if (sizeFromIoctl(stdout_fd)) |detected| return detected;
+    if (detectedSize(stdout_fd)) |detected| return detected;
     return .{ .width = envInt(environ, "COLUMNS", 80), .height = envInt(environ, "LINES", 24) };
 }
 
-fn sizeFromIoctl(stdout_fd: std.posix.fd_t) ?Size {
+pub fn detectedSize(stdout_fd: std.posix.fd_t) ?Size {
     switch (builtin.os.tag) {
-        .linux => {
+        .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly => {
             var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-            const rc = std.os.linux.ioctl(stdout_fd, std.os.linux.T.IOCGWINSZ, @intFromPtr(&ws));
-            if (std.posix.errno(rc) != .SUCCESS or ws.row == 0 or ws.col == 0) return null;
+            const rc = std.c.ioctl(stdout_fd, @intCast(std.posix.T.IOCGWINSZ), &ws);
+            if (std.c.errno(rc) != .SUCCESS or ws.row == 0 or ws.col == 0) return null;
             return .{ .width = ws.col, .height = ws.row };
         },
         else => return null,
@@ -66,7 +66,8 @@ fn sizeFromIoctl(stdout_fd: std.posix.fd_t) ?Size {
 
 fn envInt(environ: std.process.Environ.Map, name: []const u8, default: usize) usize {
     const value = environ.get(name) orelse return default;
-    return std.fmt.parseUnsigned(usize, value, 10) catch default;
+    const parsed = std.fmt.parseUnsigned(usize, value, 10) catch return default;
+    return if (parsed == 0) default else parsed;
 }
 
 pub const Screen = struct {
