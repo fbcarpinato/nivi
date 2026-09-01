@@ -11,6 +11,8 @@ pub const Action = enum {
     enter_visual_line,
     exit_visual,
     repeat_change,
+    repeat_search,
+    repeat_search_reverse,
 };
 
 const Operator = enum {
@@ -53,6 +55,7 @@ pub const State = struct {
     pending_g_count: ?usize = null,
     pending_replace_count: ?usize = null,
     requested_repeat_count: usize = 0,
+    requested_search_count: usize = 0,
     count: usize = 0,
     yank_register: Register = .{},
     delete_register: Register = .{},
@@ -82,6 +85,12 @@ pub const State = struct {
     pub fn takeRepeatCount(self: *State) usize {
         const repeat = self.requested_repeat_count;
         self.requested_repeat_count = 0;
+        return repeat;
+    }
+
+    pub fn takeSearchCount(self: *State) usize {
+        const repeat = self.requested_search_count;
+        self.requested_search_count = 0;
         return repeat;
     }
 
@@ -193,6 +202,11 @@ pub const State = struct {
                 self.requested_repeat_count = commandCount(self.count);
                 self.resetCommand();
                 return .repeat_change;
+            },
+            'n', 'N' => {
+                self.requested_search_count = commandCount(self.count);
+                self.resetCommand();
+                return if (ch == 'n') .repeat_search else .repeat_search_reverse;
             },
             else => {
                 self.resetCommand();

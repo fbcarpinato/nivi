@@ -63,6 +63,9 @@ visual mode. Common controls include:
 | `i`, `a`, `o`, `O` | Enter insert mode |
 | `Esc` | Return to normal mode |
 | `u`, `Ctrl-r` | Undo and redo |
+| `.` | Repeat the last change |
+| `/`, `?` | Search forward or backward incrementally |
+| `n`, `N` | Repeat the search in the same or opposite direction |
 | `:w` | Save |
 | `:q`, `:q!` | Quit, or quit without saving |
 | `:wq`, `:x` | Save and quit |

@@ -172,6 +172,62 @@ pub const Buffer = struct {
         return self.rope.chunkAt(offset);
     }
 
+    /// Find the first literal byte match in `range` without flattening the rope.
+    /// Empty needles never match, which keeps repeated editor search finite.
+    pub fn findLiteralForward(self: Buffer, needle: []const u8, range: ByteRange) !?usize {
+        return self.findLiteral(needle, range, false);
+    }
+
+    /// Find the last literal byte match in `range` without flattening the rope.
+    pub fn findLiteralBackward(self: Buffer, needle: []const u8, range: ByteRange) !?usize {
+        return self.findLiteral(needle, range, true);
+    }
+
+    fn findLiteral(self: Buffer, needle: []const u8, range: ByteRange, return_last: bool) !?usize {
+        if (needle.len == 0) return null;
+        const end = @min(range.end, self.byteLen());
+        const start = @min(range.start, end);
+        if (needle.len > end - start) return null;
+
+        const prefix = try self.allocator.alloc(usize, needle.len);
+        defer self.allocator.free(prefix);
+        prefix[0] = 0;
+        var prefix_len: usize = 0;
+        var i: usize = 1;
+        while (i < needle.len) {
+            if (needle[i] == needle[prefix_len]) {
+                prefix_len += 1;
+                prefix[i] = prefix_len;
+                i += 1;
+            } else if (prefix_len != 0) {
+                prefix_len = prefix[prefix_len - 1];
+            } else {
+                prefix[i] = 0;
+                i += 1;
+            }
+        }
+
+        var last_match: ?usize = null;
+        var matched: usize = 0;
+        var offset = start;
+        while (offset < end) {
+            const chunk = self.chunkAt(offset);
+            const bytes = chunk[0..@min(chunk.len, end - offset)];
+            for (bytes, 0..) |byte, chunk_index| {
+                while (matched != 0 and byte != needle[matched]) matched = prefix[matched - 1];
+                if (byte == needle[matched]) matched += 1;
+                if (matched == needle.len) {
+                    const match = offset + chunk_index + 1 - needle.len;
+                    if (!return_last) return match;
+                    last_match = match;
+                    matched = prefix[matched - 1];
+                }
+            }
+            offset += bytes.len;
+        }
+        return last_match;
+    }
+
     pub fn toOwnedSlice(self: Buffer, allocator: std.mem.Allocator) ![]u8 {
         return self.rope.toOwnedSlice(allocator);
     }
@@ -689,6 +745,33 @@ test "buffer line metrics" {
     const content = buffer.lineContentRange(1);
     try std.testing.expectEqual(@as(usize, 4), content.start);
     try std.testing.expectEqual(@as(usize, 7), content.end);
+}
+
+test "literal search streams across leaves and preserves overlaps" {
+    var text = [_]u8{'a'} ** 180;
+    @memcpy(text[158..164], "needle");
+    var buffer = try Buffer.initFromText(std.testing.allocator, &text);
+    defer buffer.deinit();
+
+    try std.testing.expectEqual(@as(?usize, 158), try buffer.findLiteralForward("needle", .{ .start = 0, .end = buffer.byteLen() }));
+    try std.testing.expectEqual(@as(?usize, 158), try buffer.findLiteralBackward("needle", .{ .start = 0, .end = buffer.byteLen() }));
+    try std.testing.expectEqual(@as(?usize, null), try buffer.findLiteralForward("needle", .{ .start = 0, .end = 163 }));
+
+    var overlaps = try Buffer.initFromText(std.testing.allocator, "aaaaa");
+    defer overlaps.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), try overlaps.findLiteralForward("aaa", .{ .start = 0, .end = 5 }));
+    try std.testing.expectEqual(@as(?usize, 2), try overlaps.findLiteralBackward("aaa", .{ .start = 0, .end = 5 }));
+}
+
+test "literal search handles Unicode and empty patterns" {
+    var text = [_]u8{'x'} ** 170;
+    @memcpy(text[159..162], "λx");
+    var buffer = try Buffer.initFromText(std.testing.allocator, &text);
+    defer buffer.deinit();
+
+    try std.testing.expectEqual(@as(?usize, 159), try buffer.findLiteralForward("λx", .{ .start = 0, .end = buffer.byteLen() }));
+    try std.testing.expectEqual(@as(?usize, null), try buffer.findLiteralForward("", .{ .start = 0, .end = buffer.byteLen() }));
+    try std.testing.expectEqual(@as(?usize, null), try buffer.findLiteralBackward("", .{ .start = 0, .end = buffer.byteLen() }));
 }
 
 test "cursor moves by grapheme cluster" {

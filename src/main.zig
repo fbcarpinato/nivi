@@ -9,6 +9,8 @@ const Key = nivi.input.Key;
 const Rect = nivi.render.Rect;
 
 const Mode = enum { normal, insert, command, visual, visual_line };
+const PromptKind = enum { command, search_forward, search_backward };
+const SearchDirection = enum { forward, backward };
 const WorkspaceCommand = enum { toggle_undo_tree };
 const KeyMapping = struct {
     sequence: []const u21,
@@ -94,6 +96,11 @@ const App = struct {
     cursor_line: usize = 0,
     cursor_visual_column: usize = 0,
     command: std.ArrayListUnmanaged(u8) = .empty,
+    prompt_kind: PromptKind = .command,
+    last_search: std.ArrayListUnmanaged(u8) = .empty,
+    last_search_direction: SearchDirection = .forward,
+    search_origin: usize = 0,
+    search_preview: ?Buffer.ByteRange = null,
     message: std.ArrayListUnmanaged(u8) = .empty,
     render_scratch: std.ArrayListUnmanaged(u8) = .empty,
     indent_scratch: std.ArrayListUnmanaged(u8) = .empty,
@@ -122,6 +129,7 @@ const App = struct {
         self.syntax.deinit();
         self.vim.deinit();
         self.command.deinit(self.allocator);
+        self.last_search.deinit(self.allocator);
         self.message.deinit(self.allocator);
         self.render_scratch.deinit(self.allocator);
         self.indent_scratch.deinit(self.allocator);
@@ -176,10 +184,18 @@ const App = struct {
 
     fn globalNormalCommand(self: *App, key: Key) bool {
         switch (key) {
-            .char => |ch| if (ch == ':') {
+            .char => |ch| if (ch == ':' or ch == '/' or ch == '?') {
                 self.vim.cancel();
                 self.mapping_len = 0;
                 self.command.clearRetainingCapacity();
+                self.prompt_kind = switch (ch) {
+                    ':' => .command,
+                    '/' => .search_forward,
+                    '?' => .search_backward,
+                    else => unreachable,
+                };
+                self.search_origin = self.cursor.offset;
+                self.search_preview = null;
                 self.setMode(.command);
                 return true;
             },
@@ -398,6 +414,8 @@ const App = struct {
             .enter_visual_line => try self.enterVisual(.visual_line),
             .exit_visual => self.setMode(.normal),
             .repeat_change => try self.repeatLastChange(self.vim.takeRepeatCount()),
+            .repeat_search => try self.repeatSearch(self.last_search_direction, self.vim.takeSearchCount()),
+            .repeat_search_reverse => try self.repeatSearch(oppositeDirection(self.last_search_direction), self.vim.takeSearchCount()),
         }
     }
 
@@ -416,6 +434,7 @@ const App = struct {
             .enter_visual_line => self.setMode(.visual_line),
             .exit_visual => self.setMode(.normal),
             .repeat_change => unreachable,
+            .repeat_search, .repeat_search_reverse => unreachable,
         }
     }
 
@@ -557,16 +576,93 @@ const App = struct {
 
     fn handleCommand(self: *App, key: Key) !void {
         switch (key) {
-            .escape => self.setMode(.normal),
-            .backspace => {
-                if (self.command.items.len != 0) _ = self.command.pop();
+            .escape => {
+                if (self.prompt_kind != .command) try self.cursor.setOffset(self.buffer.*, self.search_origin);
+                self.search_preview = null;
+                self.command.clearRetainingCapacity();
+                self.setMode(.normal);
             },
-            .enter => try self.executeCommand(),
-            .char => |ch| if (ch < 0x80 and std.ascii.isPrint(@intCast(ch))) {
-                try self.command.append(self.allocator, @intCast(ch));
+            .backspace => {
+                popUtf8(&self.command);
+                try self.previewSearch();
+            },
+            .enter => if (self.prompt_kind == .command)
+                try self.executeCommand()
+            else
+                try self.executeSearch(if (self.prompt_kind == .search_forward) .forward else .backward),
+            .char => |ch| {
+                var bytes: [4]u8 = undefined;
+                const len = try std.unicode.utf8Encode(ch, &bytes);
+                try self.command.appendSlice(self.allocator, bytes[0..len]);
+                try self.previewSearch();
             },
             else => {},
         }
+    }
+
+    fn executeSearch(self: *App, direction: SearchDirection) !void {
+        defer self.command.clearRetainingCapacity();
+        self.search_preview = null;
+        self.setMode(.normal);
+        if (self.command.items.len != 0) {
+            try self.last_search.resize(self.allocator, self.command.items.len);
+            @memcpy(self.last_search.items, self.command.items);
+        } else if (self.last_search.items.len == 0) {
+            try self.setMessage("no previous search", .{});
+            return;
+        }
+        self.last_search_direction = direction;
+        try self.cursor.setOffset(self.buffer.*, self.search_origin);
+        try self.repeatSearch(direction, 1);
+    }
+
+    fn previewSearch(self: *App) !void {
+        if (self.prompt_kind == .command) return;
+        try self.cursor.setOffset(self.buffer.*, self.search_origin);
+        self.search_preview = null;
+        if (self.command.items.len == 0) return;
+        const direction: SearchDirection = if (self.prompt_kind == .search_forward) .forward else .backward;
+        if (try self.searchOnce(direction, self.command.items)) {
+            self.search_preview = .{
+                .start = self.cursor.offset,
+                .end = self.cursor.offset + self.command.items.len,
+            };
+        }
+    }
+
+    fn repeatSearch(self: *App, direction: SearchDirection, repeat: usize) !void {
+        if (self.last_search.items.len == 0) {
+            try self.setMessage("no previous search", .{});
+            return;
+        }
+        var n: usize = 0;
+        while (n < repeat) : (n += 1) {
+            if (!try self.searchOnce(direction, self.last_search.items)) {
+                try self.setMessage("pattern not found: {s}", .{self.last_search.items});
+                return;
+            }
+        }
+        self.message.clearRetainingCapacity();
+    }
+
+    fn searchOnce(self: *App, direction: SearchDirection, needle: []const u8) !bool {
+        const len = self.buffer.byteLen();
+        if (len == 0) return false;
+        const match = switch (direction) {
+            .forward => try self.buffer.findLiteralForward(needle, .{
+                .start = @min(self.cursor.offset +| 1, len),
+                .end = len,
+            }) orelse try self.buffer.findLiteralForward(needle, .{ .start = 0, .end = len }),
+            .backward => blk: {
+                const before_end = @min(len, self.cursor.offset +| (needle.len - 1));
+                break :blk try self.buffer.findLiteralBackward(needle, .{
+                    .start = 0,
+                    .end = before_end,
+                }) orelse try self.buffer.findLiteralBackward(needle, .{ .start = 0, .end = len });
+            },
+        } orelse return false;
+        try self.cursor.setOffset(self.buffer.*, match);
+        return true;
     }
 
     fn executeCommand(self: *App) !void {
@@ -630,6 +726,7 @@ const App = struct {
         return switch (self.mode) {
             .visual => try nivi.vim.selectedRange(self.buffer.*, self.selection, false),
             .visual_line => try nivi.vim.selectedRange(self.buffer.*, self.selection, true),
+            .command => if (self.prompt_kind == .command) null else self.search_preview,
             else => null,
         };
     }
@@ -844,7 +941,7 @@ const App = struct {
         const mode = switch (self.mode) {
             .normal => "NORMAL",
             .insert => "INSERT",
-            .command => "COMMAND",
+            .command => if (self.prompt_kind == .command) "COMMAND" else "SEARCH",
             .visual => "VISUAL",
             .visual_line => "V-LINE",
         };
@@ -859,7 +956,12 @@ const App = struct {
         if (area.width == 0 or area.height == 0) return;
         switch (self.mode) {
             .command => {
-                surface.putCell(area.x, area.y, .ascii(':', .{ .fg = .accent }));
+                const prefix: u8 = switch (self.prompt_kind) {
+                    .command => ':',
+                    .search_forward => '/',
+                    .search_backward => '?',
+                };
+                surface.putCell(area.x, area.y, .ascii(prefix, .{ .fg = .accent }));
                 if (area.width > 1) surface.writeAscii(area.x + 1, area.y, area.width - 1, self.command.items, .{ .fg = .accent });
             },
             else => if (self.message.items.len != 0) {
@@ -1175,6 +1277,17 @@ fn trimLeft(text: []const u8) []const u8 {
     return text[index..];
 }
 
+fn popUtf8(text: *std.ArrayListUnmanaged(u8)) void {
+    if (text.items.len == 0) return;
+    var start = text.items.len - 1;
+    while (start > 0 and text.items[start] & 0xc0 == 0x80) : (start -= 1) {}
+    text.items.len = start;
+}
+
+fn oppositeDirection(direction: SearchDirection) SearchDirection {
+    return if (direction == .forward) .backward else .forward;
+}
+
 test "app groups insert-mode typing into one undo node" {
     var buffer = try Buffer.initFromText(std.testing.allocator, "");
     defer buffer.deinit();
@@ -1364,6 +1477,115 @@ test "command mode is available from undo tree focus" {
 
     try app.handleKey(.{ .char = ':' });
     try std.testing.expectEqual(Mode.command, app.mode);
+}
+
+test "literal search navigates forward backward and with counts" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "α x α x α");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = '/' });
+    try app.handleKey(.{ .char = 'α' });
+    try app.handleKey(.enter);
+    try std.testing.expectEqual(@as(usize, 5), app.cursor.offset);
+
+    try app.handleKey(.{ .char = '2' });
+    try app.handleKey(.{ .char = 'n' });
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'N' });
+    try std.testing.expectEqual(@as(usize, 10), app.cursor.offset);
+
+    try app.handleKey(.{ .char = '?' });
+    try app.handleKey(.{ .char = 'x' });
+    try app.handleKey(.enter);
+    try std.testing.expectEqual(@as(usize, 8), app.cursor.offset);
+    try std.testing.expectEqual(SearchDirection.backward, app.last_search_direction);
+}
+
+test "incremental search previews accepts and cancels the first match" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one two one");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = '/' });
+    try app.handleKey(.{ .char = 't' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try std.testing.expectEqual(Buffer.ByteRange{ .start = 4, .end = 5 }, app.search_preview.?);
+    try std.testing.expectEqual(Buffer.ByteRange{ .start = 4, .end = 5 }, (try app.renderSelection()).?);
+    try app.handleKey(.{ .char = 'w' });
+    try std.testing.expectEqual(Buffer.ByteRange{ .start = 4, .end = 6 }, app.search_preview.?);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+    try std.testing.expectEqual(@as(?Buffer.ByteRange, null), app.search_preview);
+
+    try app.handleKey(.{ .char = '/' });
+    for ("two") |ch| try app.handleKey(.{ .char = ch });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.enter);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try std.testing.expectEqual(@as(?Buffer.ByteRange, null), app.search_preview);
+}
+
+test "failed and empty searches keep the cursor stable" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one two");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, 4),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'n' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try std.testing.expectEqualStrings("no previous search", app.message.items);
+
+    try app.handleKey(.{ .char = '/' });
+    for ("missing") |ch| try app.handleKey(.{ .char = ch });
+    try app.handleKey(.enter);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try std.testing.expectEqualStrings("pattern not found: missing", app.message.items);
+
+    try app.handleKey(.{ .char = '/' });
+    try app.handleKey(.enter);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+}
+
+test "search prompt backspace removes one UTF-8 codepoint" {
+    var prompt: std.ArrayListUnmanaged(u8) = .empty;
+    defer prompt.deinit(std.testing.allocator);
+    try prompt.appendSlice(std.testing.allocator, "aλ");
+
+    popUtf8(&prompt);
+    try std.testing.expectEqualStrings("a", prompt.items);
+    popUtf8(&prompt);
+    try std.testing.expectEqualStrings("", prompt.items);
 }
 
 test "key mapping toggles undo component" {
