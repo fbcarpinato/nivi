@@ -565,6 +565,7 @@ pub const State = struct {
         self.resetCommand();
         try cursor.sync(buffer.*);
         const line = buffer.lineAt(cursor.offset);
+        const opens_final_line = position == .below and line + 1 >= buffer.lineCount();
         const at = switch (position) {
             .above => buffer.byteOffsetForLine(line),
             .below => blk: {
@@ -573,7 +574,7 @@ pub const State = struct {
             },
         };
         try buffer.insert(at, "\n");
-        try cursor.setOffset(buffer.*, at);
+        try cursor.setOffset(buffer.*, at + @intFromBool(opens_final_line));
         return .enter_insert;
     }
 

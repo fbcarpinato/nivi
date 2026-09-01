@@ -490,6 +490,18 @@ pub const Cursor = struct {
         self.goal_column = null;
     }
 
+    /// Clamp an insertion-point offset to a character position for modes that
+    /// render a block caret. Empty lines retain their sole insertion point.
+    pub fn normalizeCharacterPosition(self: *Cursor, buffer: Buffer) !void {
+        try self.sync(buffer);
+        self.offset = try buffer.rope.resolveUtf8Boundary(self.offset, .clamp_backward);
+        const range = buffer.lineContentRange(buffer.lineAt(self.offset));
+        if (range.start != range.end and self.offset >= range.end) {
+            self.offset = try buffer.rope.prevGraphemeBoundary(range.end);
+        }
+        self.generation = buffer.generation;
+    }
+
     /// Ensure the cached `rope_cursor` matches the current buffer state and
     /// caret offset; re-seed from the root only when stale.
     fn ensureRopeCursor(self: *Cursor, buffer: *Buffer) void {

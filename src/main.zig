@@ -115,6 +115,7 @@ const App = struct {
     mapping_buffer: [8]u21 = undefined,
     mapping_len: usize = 0,
     insert_group_open: bool = false,
+    insert_exit_offset: usize = 0,
     repeat_keys: std.ArrayListUnmanaged(Key) = .empty,
     repeat_candidate: std.ArrayListUnmanaged(Key) = .empty,
     repeat_start_generation: u64 = 0,
@@ -165,6 +166,7 @@ const App = struct {
                 .visual, .visual_line => try self.handleVisual(key),
             }
         }
+        try self.normalizeCursorForMode();
         self.updateRepeatCandidate();
         if (self.buffer.generation != before_generation) {
             if (self.buffer.generation == before_generation + 1) {
@@ -209,8 +211,39 @@ const App = struct {
             self.closeInsertGroup();
             if (self.syntax_generation != self.buffer.generation) self.syntax_refresh_after_ns = 0;
         }
+        if (self.mode != .insert and mode == .insert) self.insert_exit_offset = self.cursor.offset;
         if (mode != .normal) self.mapping_len = 0;
         self.mode = mode;
+    }
+
+    fn normalizeCursorForMode(self: *App) !void {
+        if (self.mode == .insert) return;
+        const before = self.cursor.offset;
+        try self.cursor.normalizeCharacterPosition(self.buffer.*);
+        if (self.cursor.offset != before and (self.mode == .visual or self.mode == .visual_line)) {
+            self.selection.setHead(self.buffer.*, self.cursor.offset);
+        }
+    }
+
+    fn enterInsertMode(self: *App, after_character: bool) !void {
+        self.setMode(.insert);
+        var exit_cursor = Cursor.at(self.buffer.*, self.cursor.offset);
+        if (after_character) {
+            try exit_cursor.moveLeft(self.buffer.*);
+        } else {
+            try exit_cursor.normalizeCharacterPosition(self.buffer.*);
+        }
+        self.insert_exit_offset = exit_cursor.offset;
+    }
+
+    fn updateInsertExit(self: *App, after_insertion: bool) !void {
+        var exit_cursor = Cursor.at(self.buffer.*, self.cursor.offset);
+        if (after_insertion) {
+            try exit_cursor.moveLeft(self.buffer.*);
+        } else {
+            try exit_cursor.normalizeCharacterPosition(self.buffer.*);
+        }
+        self.insert_exit_offset = exit_cursor.offset;
     }
 
     fn ensureInsertGroup(self: *App) void {
@@ -409,7 +442,10 @@ const App = struct {
     fn handleVimNormal(self: *App, key: Key) !void {
         switch (try self.vim.handleNormal(self.buffer, &self.cursor, key)) {
             .none => {},
-            .enter_insert => self.setMode(.insert),
+            .enter_insert => try self.enterInsertMode(switch (key) {
+                .char => |ch| ch == 'a' or ch == 'A',
+                else => false,
+            }),
             .enter_visual => try self.enterVisual(.visual),
             .enter_visual_line => try self.enterVisual(.visual_line),
             .exit_visual => self.setMode(.normal),
@@ -429,7 +465,7 @@ const App = struct {
         try self.recordRepeatKey(key);
         switch (try self.vim.handleVisual(self.buffer, &self.cursor, &self.selection, self.mode == .visual_line, key)) {
             .none => {},
-            .enter_insert => self.setMode(.insert),
+            .enter_insert => try self.enterInsertMode(false),
             .enter_visual => try self.enterVisual(.visual),
             .enter_visual_line => self.setMode(.visual_line),
             .exit_visual => self.setMode(.normal),
@@ -441,36 +477,46 @@ const App = struct {
     fn handleInsert(self: *App, key: Key) !void {
         if (self.repeat_group_open) try self.recordRepeatKey(key);
         switch (key) {
-            .escape => self.setMode(.normal),
+            .escape => {
+                try self.cursor.setOffset(self.buffer.*, self.insert_exit_offset);
+                self.setMode(.normal);
+            },
             .enter => {
                 self.ensureInsertGroup();
                 const columns = try self.desiredIndent(self.cursor.offset, true);
                 const text = try self.newlineWithIndent(columns);
                 try self.cursor.insertText(self.buffer, text);
+                try self.updateInsertExit(true);
             },
             .backspace => {
                 self.ensureInsertGroup();
                 try self.cursor.deleteBackward(self.buffer);
+                try self.updateInsertExit(false);
             },
             .delete => {
                 self.ensureInsertGroup();
                 try self.cursor.deleteForward(self.buffer);
+                try self.updateInsertExit(false);
             },
             .arrow_left => {
                 self.closeInsertGroup();
                 try self.cursor.moveLeft(self.buffer.*);
+                try self.updateInsertExit(false);
             },
             .arrow_right => {
                 self.closeInsertGroup();
                 try self.cursor.moveRight(self.buffer.*);
+                try self.updateInsertExit(false);
             },
             .arrow_up => {
                 self.closeInsertGroup();
                 try self.cursor.moveUp(self.buffer.*);
+                try self.updateInsertExit(false);
             },
             .arrow_down => {
                 self.closeInsertGroup();
                 try self.cursor.moveDown(self.buffer.*);
+                try self.updateInsertExit(false);
             },
             .char => |ch| {
                 const token_start = self.cursor.offset;
@@ -480,6 +526,7 @@ const App = struct {
                 self.ensureInsertGroup();
                 try self.cursor.insertText(self.buffer, bytes[0..len]);
                 if (line_prefix_is_whitespace) try self.reindentIfIndentEnd(token_start, len);
+                try self.updateInsertExit(true);
             },
             else => {},
         }
@@ -528,6 +575,7 @@ const App = struct {
         if (columns != 0) {
             const indent = try self.indentText(columns);
             try self.cursor.insertText(self.buffer, indent);
+            try self.updateInsertExit(true);
         }
     }
 
@@ -1339,6 +1387,246 @@ test "app undo after insert-mode typing removes whole group" {
     try std.testing.expectEqualStrings("", text);
 }
 
+test "normal and visual cursors stay on grapheme positions" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abc\n\nλx");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = '$' });
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+    try app.handleKey(.{ .char = 'l' });
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'j' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.{ .char = 'j' });
+    try std.testing.expectEqual(@as(usize, 7), app.cursor.offset);
+    try app.handleKey(.{ .char = 'k' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.{ .char = 'k' });
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+
+    try app.cursor.setOffset(buffer, 0);
+    try app.handleKey(.{ .char = 'v' });
+    try app.handleKey(.{ .char = '$' });
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+    try std.testing.expectEqual(@as(usize, 2), app.selection.head);
+    try std.testing.expectEqual(Buffer.ByteRange{ .start = 0, .end = 3 }, (try app.renderSelection()).?);
+}
+
+test "normal line end uses visual columns for tabs and wide glyphs" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "\tX\na🌊");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = '$' });
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor_visual_column);
+
+    try app.handleKey(.{ .char = 'j' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor_visual_column);
+    try app.handleKey(.{ .char = 'l' });
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+}
+
+test "insert entry and escape preserve Vim caret semantics" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abc");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, 1),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+    try app.handleKey(.{ .char = 'a' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+    try app.handleKey(.{ .char = 'A' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+
+    try app.cursor.setOffset(buffer, 1);
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.{ .char = 'X' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'a' });
+    try app.handleKey(.{ .char = 'λ' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'A' });
+    try app.handleKey(.{ .char = 'Z' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 6), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'I' });
+    try app.handleKey(.{ .char = 'Q' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("QaXλbcZ", text);
+}
+
+test "insert backspace and arrows update the escape position" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abc");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, 1),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.{ .char = 'X' });
+    try app.handleKey(.backspace);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.arrow_right);
+    try app.handleKey(.arrow_right);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 2), app.cursor.offset);
+}
+
+test "change commands and Visual insert exit on inserted text" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one two");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'c' });
+    try app.handleKey(.{ .char = 'w' });
+    try app.handleKey(.{ .char = 'X' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+
+    try app.cursor.setOffset(buffer, 1);
+    try app.handleKey(.{ .char = 'v' });
+    try app.handleKey(.{ .char = 'l' });
+    try app.handleKey(.{ .char = 'c' });
+    try app.handleKey(.{ .char = 'Y' });
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("XYo", text);
+}
+
+test "normal cursor normalizes after edits undo redo and stale generations" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.at(buffer, 1),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'x' });
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+    try app.handleKey(.{ .char = 'u' });
+    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+    try app.handleKey(.{ .ctrl = 'r' });
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+
+    try buffer.setText("áb");
+    try app.cursor.setOffset(buffer, buffer.byteLen());
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 3), app.cursor.offset);
+    try app.handleKey(.{ .char = 'h' });
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
+    try app.handleKey(.{ .char = 'l' });
+    try std.testing.expectEqual(@as(usize, 3), app.cursor.offset);
+}
+
+test "open line below EOF enters the new empty line" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'o' });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+
+    try app.handleKey(.{ .char = 'O' });
+    try std.testing.expectEqual(Mode.insert, app.mode);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("one\n\n", text);
+}
+
 test "dot repeats operator motion changes" {
     var buffer = try Buffer.initFromText(std.testing.allocator, "one two three four");
     defer buffer.deinit();
@@ -1642,7 +1930,7 @@ test "workspace focus keys and undo actions update the buffer" {
     const text = try buffer.toOwnedSlice(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("a", text);
-    try std.testing.expectEqual(@as(usize, 1), app.cursor.offset);
+    try std.testing.expectEqual(@as(usize, 0), app.cursor.offset);
 }
 
 test "retained rendering clears stale editor and command cells" {
