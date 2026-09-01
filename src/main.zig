@@ -108,10 +108,16 @@ const App = struct {
     mapping_buffer: [8]u21 = undefined,
     mapping_len: usize = 0,
     insert_group_open: bool = false,
+    repeat_keys: std.ArrayListUnmanaged(Key) = .empty,
+    repeat_candidate: std.ArrayListUnmanaged(Key) = .empty,
+    repeat_start_generation: u64 = 0,
+    repeat_group_open: bool = false,
+    replaying_change: bool = false,
     should_quit: bool = false,
 
     fn deinit(self: *App) void {
         self.closeInsertGroup();
+        self.discardRepeatCandidate();
         self.workspace.deinit();
         self.syntax.deinit();
         self.vim.deinit();
@@ -121,6 +127,8 @@ const App = struct {
         self.indent_scratch.deinit(self.allocator);
         self.syntax_highlights.deinit(self.allocator);
         self.syntax_highlights_back.deinit(self.allocator);
+        self.repeat_keys.deinit(self.allocator);
+        self.repeat_candidate.deinit(self.allocator);
     }
 
     fn setMessage(self: *App, comptime fmt: []const u8, args: anytype) !void {
@@ -130,7 +138,8 @@ const App = struct {
         try self.message.appendSlice(self.allocator, text);
     }
 
-    fn handleKey(self: *App, key: Key) !void {
+    fn handleKey(self: *App, key: Key) anyerror!void {
+        errdefer if (!self.replaying_change) self.discardRepeatCandidate();
         const before_generation = self.buffer.generation;
         if (self.mode == .normal and self.globalNormalCommand(key)) {
             // handled global normal-mode command
@@ -148,6 +157,7 @@ const App = struct {
                 .visual, .visual_line => try self.handleVisual(key),
             }
         }
+        self.updateRepeatCandidate();
         if (self.buffer.generation != before_generation) {
             if (self.buffer.generation == before_generation + 1) {
                 self.adjustSyntaxHighlightsForLastEdit(before_generation);
@@ -197,6 +207,60 @@ const App = struct {
         if (!self.insert_group_open) return;
         self.buffer.endUndoGroup(self.cursor.offset);
         self.insert_group_open = false;
+    }
+
+    fn recordRepeatKey(self: *App, key: Key) !void {
+        if (self.replaying_change) return;
+        switch (key) {
+            .unknown => return,
+            else => {},
+        }
+        if (!self.repeat_group_open) {
+            self.repeat_candidate.clearRetainingCapacity();
+            self.repeat_start_generation = self.buffer.generation;
+            self.buffer.beginUndoGroup(self.cursor.offset);
+            self.repeat_group_open = true;
+        }
+        try self.repeat_candidate.append(self.allocator, key);
+    }
+
+    fn updateRepeatCandidate(self: *App) void {
+        if (self.replaying_change or !self.repeat_group_open) return;
+        if (self.mode == .insert or self.mode == .visual or self.mode == .visual_line) return;
+        if (self.buffer.generation != self.repeat_start_generation) {
+            self.buffer.endUndoGroup(self.cursor.offset);
+            self.repeat_group_open = false;
+            const previous = self.repeat_keys;
+            self.repeat_keys = self.repeat_candidate;
+            self.repeat_candidate = previous;
+            self.repeat_candidate.clearRetainingCapacity();
+        } else if (!self.vim.hasPendingCommand()) {
+            self.discardRepeatCandidate();
+        }
+    }
+
+    fn discardRepeatCandidate(self: *App) void {
+        if (self.repeat_group_open) self.buffer.endUndoGroup(self.cursor.offset);
+        self.repeat_group_open = false;
+        self.repeat_candidate.clearRetainingCapacity();
+    }
+
+    fn repeatLastChange(self: *App, repeat: usize) !void {
+        if (self.repeat_keys.items.len == 0) return;
+        self.replaying_change = true;
+        defer self.replaying_change = false;
+
+        self.buffer.beginUndoGroup(self.cursor.offset);
+        var group_open = true;
+        defer if (group_open) self.buffer.endUndoGroup(self.cursor.offset);
+
+        var n: usize = 0;
+        while (n < repeat) : (n += 1) {
+            for (self.repeat_keys.items) |key| try self.handleKey(key);
+        }
+
+        self.buffer.endUndoGroup(self.cursor.offset);
+        group_open = false;
     }
 
     fn handleMapping(self: *App, key: Key) !bool {
@@ -276,20 +340,43 @@ const App = struct {
             .char => |ch| switch (ch) {
                 ':' => {},
                 'u' => {
+                    self.discardRepeatCandidate();
                     self.vim.cancel();
                     if (try self.buffer.undo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
                 },
-                'o' => try self.openIndentedLine(key, true),
-                'O' => try self.openIndentedLine(key, false),
-                else => try self.handleVimNormal(key),
+                else => {
+                    if (ch == '.') {
+                        self.discardRepeatCandidate();
+                        try self.handleVimNormal(key);
+                    } else if (ch == 'o') {
+                        try self.recordRepeatKey(key);
+                        try self.openIndentedLine(key, true);
+                    } else if (ch == 'O') {
+                        try self.recordRepeatKey(key);
+                        try self.openIndentedLine(key, false);
+                    } else {
+                        try self.recordRepeatKey(key);
+                        try self.handleVimNormal(key);
+                    }
+                },
             },
             .ctrl => |ch| if (ch == 'r') {
+                self.discardRepeatCandidate();
                 self.vim.cancel();
                 if (try self.buffer.redo()) |offset| try self.cursor.setOffset(self.buffer.*, offset);
-            } else try self.handleVimNormal(key),
-            .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => try self.handleVimNormal(key),
-            .unknown => |bytes| try self.setUnknownKeyMessage(bytes),
-            else => {},
+            } else {
+                try self.recordRepeatKey(key);
+                try self.handleVimNormal(key);
+            },
+            .arrow_left, .arrow_right, .arrow_up, .arrow_down, .ctrl_arrow_up, .ctrl_arrow_down, .home, .end, .page_up, .page_down => {
+                try self.recordRepeatKey(key);
+                try self.handleVimNormal(key);
+            },
+            .unknown => |bytes| {
+                self.vim.cancel();
+                try self.setUnknownKeyMessage(bytes);
+            },
+            else => self.vim.cancel(),
         }
     }
 
@@ -310,6 +397,7 @@ const App = struct {
             .enter_visual => try self.enterVisual(.visual),
             .enter_visual_line => try self.enterVisual(.visual_line),
             .exit_visual => self.setMode(.normal),
+            .repeat_change => try self.repeatLastChange(self.vim.takeRepeatCount()),
         }
     }
 
@@ -320,16 +408,19 @@ const App = struct {
     }
 
     fn handleVisual(self: *App, key: Key) !void {
+        try self.recordRepeatKey(key);
         switch (try self.vim.handleVisual(self.buffer, &self.cursor, &self.selection, self.mode == .visual_line, key)) {
             .none => {},
             .enter_insert => self.setMode(.insert),
             .enter_visual => try self.enterVisual(.visual),
             .enter_visual_line => self.setMode(.visual_line),
             .exit_visual => self.setMode(.normal),
+            .repeat_change => unreachable,
         }
     }
 
     fn handleInsert(self: *App, key: Key) !void {
+        if (self.repeat_group_open) try self.recordRepeatKey(key);
         switch (key) {
             .escape => self.setMode(.normal),
             .enter => {
@@ -1133,6 +1224,92 @@ test "app undo after insert-mode typing removes whole group" {
     const text = try buffer.toOwnedSlice(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("", text);
+}
+
+test "dot repeats operator motion changes" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "one two three four");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'd' });
+    try app.handleKey(.{ .char = 'w' });
+    try app.handleKey(.{ .char = '.' });
+    try app.handleKey(.{ .char = '.' });
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("four", text);
+}
+
+test "counted dot repeat is one undo unit" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "abcdef");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'x' });
+    try app.handleKey(.{ .char = '2' });
+    try app.handleKey(.{ .char = '.' });
+
+    var text = try buffer.toOwnedSlice(std.testing.allocator);
+    try std.testing.expectEqualStrings("def", text);
+    std.testing.allocator.free(text);
+
+    try app.handleKey(.{ .char = 'u' });
+    text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("bcdef", text);
+}
+
+test "dot repeats Unicode insert and ignores failed commands" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "a a");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(.{ .char = 'λ' });
+    try app.handleKey(.escape);
+
+    try app.cursor.setOffset(buffer, buffer.byteLen());
+    try app.handleKey(.{ .char = 'x' });
+    try app.handleKey(.{ .char = 'd' });
+    try app.handleKey(.escape);
+
+    try app.cursor.setOffset(buffer, 4);
+    try app.handleKey(.{ .char = '.' });
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("λa λa", text);
 }
 
 test "undo panel render does not split active insert group" {

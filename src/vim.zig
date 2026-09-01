@@ -10,6 +10,7 @@ pub const Action = enum {
     enter_visual,
     enter_visual_line,
     exit_visual,
+    repeat_change,
 };
 
 const Operator = enum {
@@ -51,6 +52,7 @@ pub const State = struct {
     pending: ?Pending = null,
     pending_g_count: ?usize = null,
     pending_replace_count: ?usize = null,
+    requested_repeat_count: usize = 0,
     count: usize = 0,
     yank_register: Register = .{},
     delete_register: Register = .{},
@@ -71,6 +73,16 @@ pub const State = struct {
 
     pub fn cancel(self: *State) void {
         self.resetCommand();
+    }
+
+    pub fn hasPendingCommand(self: State) bool {
+        return self.pending != null or self.pending_g_count != null or self.pending_replace_count != null or self.count != 0;
+    }
+
+    pub fn takeRepeatCount(self: *State) usize {
+        const repeat = self.requested_repeat_count;
+        self.requested_repeat_count = 0;
+        return repeat;
     }
 
     pub fn handleNormal(self: *State, buffer: *Buffer, cursor: *Cursor, key: Key) !Action {
@@ -177,6 +189,11 @@ pub const State = struct {
             'y' => return self.handleOperator(buffer, cursor, .yank),
             'p' => return self.paste(buffer, cursor, .after),
             'P' => return self.paste(buffer, cursor, .before),
+            '.' => {
+                self.requested_repeat_count = commandCount(self.count);
+                self.resetCommand();
+                return .repeat_change;
+            },
             else => {
                 self.resetCommand();
                 return .none;
