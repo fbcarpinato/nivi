@@ -488,6 +488,14 @@ const App = struct {
                 try self.cursor.insertText(self.buffer, text);
                 try self.updateInsertExit(true);
             },
+            .ctrl => |ch| if (ch == 'i') {
+                self.ensureInsertGroup();
+                const width = self.buffer.tab_width;
+                const column = try self.cursor.visualColumn(self.buffer.*);
+                const text = try self.indentText(width - (column % width));
+                try self.cursor.insertText(self.buffer, text);
+                try self.updateInsertExit(true);
+            },
             .backspace => {
                 self.ensureInsertGroup();
                 try self.cursor.deleteBackward(self.buffer);
@@ -2110,6 +2118,42 @@ test "cached syntax drops edited span and shifts later spans" {
     try std.testing.expectEqual(@as(usize, 1), app.syntax_highlights.items.len);
     try std.testing.expectEqual(@as(usize, 7), app.syntax_highlights.items[0].start);
     try std.testing.expectEqual(@as(usize, 8), app.syntax_highlights.items[0].end);
+}
+
+test "insert tab expands to spaces with undo and repeat" {
+    var buffer = try Buffer.initFromText(std.testing.allocator, "");
+    defer buffer.deinit();
+    var app: App = .{
+        .allocator = std.testing.allocator,
+        .io = undefined,
+        .buffer = &buffer,
+        .cursor = Cursor.init(buffer),
+        .selection = Selection.init(buffer),
+        .vim = nivi.vim.State.init(std.testing.allocator),
+        .syntax = try nivi.syntax.Highlighter.init(std.testing.io, std.testing.allocator, null),
+        .workspace = try nivi.Workspace.init(std.testing.allocator),
+    };
+    defer app.deinit();
+    const tab = nivi.input.decode("\t").?.key;
+
+    try app.handleKey(.{ .char = 'i' });
+    try app.handleKey(tab);
+    try std.testing.expectEqual(@as(usize, 4), app.cursor.offset);
+    try app.handleKey(.{ .char = 'x' });
+    try app.handleKey(tab);
+    try std.testing.expectEqual(@as(usize, 8), app.cursor.offset);
+    try app.handleKey(.escape);
+    try std.testing.expectEqual(@as(usize, 7), app.cursor.offset);
+
+    const text = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("    x   ", text);
+    try app.handleKey(.{ .char = 'u' });
+    try std.testing.expectEqual(@as(usize, 0), buffer.byteLen());
+    try app.handleKey(.{ .char = '.' });
+    const repeated = try buffer.toOwnedSlice(std.testing.allocator);
+    defer std.testing.allocator.free(repeated);
+    try std.testing.expectEqualStrings(text, repeated);
 }
 
 test "query indentation applies to open-line and enter" {
